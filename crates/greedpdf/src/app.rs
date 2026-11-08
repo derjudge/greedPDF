@@ -139,6 +139,8 @@ pub enum Action {
     Result(usize),
     /// Clic sur un bouton de la barre de recherche : prev, next, case, words.
     SearchButton(String),
+    /// Clic sur un bouton de rotation de la barre : left, right.
+    RotateButton(String),
     /// Clic sur le champ de page / sur le bouton du volet (barre d'outils).
     PageField,
     SidebarButton,
@@ -186,6 +188,7 @@ pub fn parse_script(s: &str) -> anyhow::Result<Vec<Action>> {
                 "saveimage" => Action::SaveImage(parts.get(1).unwrap_or(&"page.png").to_string()),
                 "propscopy" => Action::PropsCopy,
                 "pagefield" => Action::PageField,
+                "rotbtn" => Action::RotateButton(parts.get(1).unwrap_or(&"right").to_string()),
                 "search" => Action::Search(parts.get(1).unwrap_or(&"").to_string()),
                 "result" => Action::Result(num(1)? as usize),
                 "searchbtn" => Action::SearchButton(parts.get(1).unwrap_or(&"next").to_string()),
@@ -264,6 +267,8 @@ pub struct App {
     result_tex: HashMap<usize, [Tex; 4]>,
     chevrons: Option<(Tex, Tex)>,
     cross: Option<Tex>,
+    /// Icônes de rotation : anti-horaire, horaire.
+    rot_icons: Option<(Tex, Tex)>,
     modifiers: ModifiersState,
     cursor: (f32, f32),
     press: Option<((f32, f32), (f32, f32))>,
@@ -338,6 +343,7 @@ impl App {
             result_tex: HashMap::new(),
             chevrons: None,
             cross: None,
+            rot_icons: None,
             modifiers: ModifiersState::empty(),
             cursor: (0.0, 0.0),
             press: None,
@@ -437,6 +443,14 @@ impl App {
     fn search_toggle(&self) -> Rect {
         let o = self.options_button();
         Rect::new(o.x - o.h - 8.0, o.y, o.h, o.h)
+    }
+
+    /// Boutons de rotation (anti-horaire, horaire), à gauche de la loupe.
+    fn rotate_buttons(&self) -> (Rect, Rect) {
+        let l = self.search_toggle();
+        let right = Rect::new(l.x - l.h - 8.0, l.y, l.h, l.h);
+        let left = Rect::new(right.x - right.h - 2.0, l.y, l.h, l.h);
+        (left, right)
     }
 
     /// Champ de la barre de recherche (centré sous la barre d'outils).
@@ -1135,6 +1149,50 @@ impl App {
         }
     }
 
+    /// Flèche circulaire de rotation (`clockwise` : sens horaire, ↻).
+    fn make_rotate_icon(size: u32, clockwise: bool) -> greedpdf_core::PixelBuf {
+        let mut img = greedpdf_core::PixelBuf::default();
+        img.reset(size, size);
+        let s = size as f32;
+        let (cx, cy, r, th) = (0.5 * s, 0.54 * s, 0.28 * s, 0.09 * s);
+        // Arc ouvert en haut à droite, fin de l'arc en haut avec la pointe
+        // dirigée dans le sens horaire (axe y vers le bas : angle croissant).
+        let end = 260f32.to_radians();
+        let (px_, py_) = (cx + r * end.cos(), cy + r * end.sin());
+        let (tx, ty) = (-end.sin(), end.cos()); // tangente (sens horaire)
+        let (nx, ny) = (end.cos(), end.sin()); // normale (vers l'extérieur)
+        let tri = [
+            (px_ + tx * 0.24 * s, py_ + ty * 0.24 * s),
+            (px_ + nx * 0.16 * s - tx * 0.02 * s, py_ + ny * 0.16 * s - ty * 0.02 * s),
+            (px_ - nx * 0.16 * s - tx * 0.02 * s, py_ - ny * 0.16 * s - ty * 0.02 * s),
+        ];
+        // Distance signée (négative à l'intérieur) au triangle, approchée par les arêtes.
+        let edge = |x: f32, y: f32, a: (f32, f32), b: (f32, f32)| {
+            let (ex, ey) = (b.0 - a.0, b.1 - a.1);
+            let len = (ex * ex + ey * ey).sqrt();
+            ((x - a.0) * ey - (y - a.1) * ex) / len
+        };
+        let orient = edge(tri[2].0, tri[2].1, tri[0], tri[1]).signum();
+        for y in 0..size {
+            for x in 0..size {
+                let sx = if clockwise { x as f32 + 0.5 } else { s - (x as f32 + 0.5) };
+                let sy = y as f32 + 0.5;
+                let ang = (sy - cy).atan2(sx - cx).to_degrees();
+                let in_arc = !(ang > -100.0 && ang < -20.0);
+                let ring = (((sx - cx).powi(2) + (sy - cy).powi(2)).sqrt() - r).abs() - th / 2.0;
+                let arc_cov = if in_arc { (0.5 - ring).clamp(0.0, 1.0) } else { 0.0 };
+                let d = (0..3)
+                    .map(|i| -orient * edge(sx, sy, tri[i], tri[(i + 1) % 3]))
+                    .fold(f32::MIN, f32::max);
+                let tri_cov = (0.5 - d).clamp(0.0, 1.0);
+                let v = (arc_cov.max(tri_cov) * 255.0) as u8;
+                let i = ((y * size + x) * 4) as usize;
+                img.data[i..i + 4].copy_from_slice(&[v, v, v, v]);
+            }
+        }
+        img
+    }
+
     /// Croix (deux diagonales) pour fermer la barre de recherche.
     fn make_cross(size: u32) -> greedpdf_core::PixelBuf {
         let mut img = greedpdf_core::PixelBuf::default();
@@ -1755,6 +1813,11 @@ impl App {
                     self.open_goto(String::new());
                     return;
                 }
+                let (rl, rr) = self.rotate_buttons();
+                if rl.contains(x, y) || rr.contains(x, y) {
+                    self.rotate(if rr.contains(x, y) { 90 } else { -90 });
+                    return;
+                }
                 if self.search_toggle().contains(x, y) {
                     if self.search_open { self.close_search() } else { self.open_search() }
                     return;
@@ -1904,6 +1967,9 @@ impl App {
             self.chevrons = Some((g.upload(u.w, u.h, &u.data, false), g.upload(d.w, d.h, &d.data, false)));
             let c = Self::make_cross((self.bar_item_h() * 0.55).round() as u32);
             self.cross = Some(g.upload(c.w, c.h, &c.data, false));
+            let sz = (self.bar_item_h() * 0.75).round() as u32;
+            let (ccw, cw) = (Self::make_rotate_icon(sz, false), Self::make_rotate_icon(sz, true));
+            self.rot_icons = Some((g.upload(ccw.w, ccw.h, &ccw.data, false), g.upload(cw.w, cw.h, &cw.data, false)));
         }
         self.prepare_result_textures();
 
@@ -2097,6 +2163,18 @@ impl App {
         }
         let total = self.page_total_label();
         label(items, &total, px, f.x + f.w + px * 0.5, ty, [0.8, 0.8, 0.8, 0.8]);
+        // Boutons de rotation.
+        let (rl, rr) = self.rotate_buttons();
+        for r in [rl, rr] {
+            let hv = r.contains(self.cursor.0, self.cursor.1);
+            items.push(plain(g.white(), r, if hv { [0.2, 0.2, 0.23, 1.0] } else { [0.13, 0.13, 0.15, 1.0] }));
+        }
+        if let Some((ccw, cw)) = &self.rot_icons {
+            for (t, r) in [(ccw, rl), (cw, rr)] {
+                let d = Rect::new((r.x + (r.w - t.w as f32) / 2.0).round(), (r.y + (r.h - t.h as f32) / 2.0).round(), t.w as f32, t.h as f32);
+                items.push(plain(t, d, [0.9, 0.9, 0.9, 1.0]));
+            }
+        }
         // Loupe de la barre d'outils (bleue quand la recherche est ouverte).
         let lb = self.search_toggle();
         let hv = lb.contains(self.cursor.0, self.cursor.1);
@@ -2518,6 +2596,14 @@ impl App {
                 self.mouse_button(MouseButton::Left, ElementState::Pressed);
                 self.mouse_button(MouseButton::Left, ElementState::Released);
                 eprintln!("[script] bouton {which} → {:?} ; page {}", self.search_label(), self.current + 1);
+            }
+            Action::RotateButton(which) => {
+                let (l, r) = self.rotate_buttons();
+                let b = if which == "left" { l } else { r };
+                self.on_cursor(b.x + b.w / 2.0, b.y + b.h / 2.0);
+                self.mouse_button(MouseButton::Left, ElementState::Pressed);
+                self.mouse_button(MouseButton::Left, ElementState::Released);
+                eprintln!("[script] rotation {which} → {}°", self.rotation);
             }
             Action::PageField | Action::SidebarButton => {
                 let r = if matches!(a_ref, Action::PageField) { self.page_field() } else { self.sidebar_button() };
