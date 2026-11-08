@@ -65,8 +65,6 @@ système (`lp`, CUPS) ; il n'y a pas encore de boîte de dialogue d'impression.
 
 ## Licence
 
-Copyright © 2026 derjudge.
-
 greedPDF est un logiciel libre : vous pouvez le redistribuer et le modifier
 selon les termes de la **GNU Affero General Public License** publiée par la
 Free Software Foundation, version 3 ou (à votre choix) toute version
