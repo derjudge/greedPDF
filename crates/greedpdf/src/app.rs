@@ -5,7 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use greedpdf_core::{DocSource, LinkTarget, page_px};
+use greedpdf_core::{DocSource, LinkTarget, PageText, page_px};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
@@ -22,10 +22,41 @@ const MIN_ZOOM: f32 = 0.1;
 const MAX_ZOOM: f32 = 40.0;
 const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum UserEvent {
     Ready(ImgKey),
     Thumb(usize),
+    /// Message temporaire affiché au-dessus de la barre d'état.
+    Toast(String),
+}
+
+/// Commandes des menus (clic droit, bouton « Options »).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Cmd {
+    CopyImage,
+    CopyText,
+    SelectAll,
+    Print,
+    Fullscreen,
+    RotateRight,
+    RotateLeft,
+    Properties,
+    Sidebar,
+}
+
+struct Menu {
+    x: f32,
+    y: f32,
+    items: Vec<(String, Cmd)>,
+    hover: Option<usize>,
+}
+
+/// Sélection de texte : page et intervalle de caractères (inclus).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Selection {
+    page: usize,
+    a: usize,
+    b: usize,
 }
 
 pub struct ProxyNotify(pub EventLoopProxy<UserEvent>);
@@ -81,10 +112,23 @@ pub enum Action {
     Wheel(f32),
     SideWheel(f32),
     CtrlWheel(f32),
+    ShiftWheel(f32),
     /// Clic de souris réel au centre du i-ième lien de la page.
     MouseLink(usize),
-    /// Glisser de (x0, y0) à (x1, y1), coordonnées de la fenêtre.
+    /// Glisser au clic droit (déplacement de la vue) de (x0, y0) à (x1, y1).
     Drag(f32, f32, f32, f32),
+    /// Glisser au clic gauche (sélection de texte).
+    Select(f32, f32, f32, f32),
+    /// Clic droit (menu contextuel) en (x, y).
+    RClick(f32, f32),
+    /// Clic sur le bouton « Options ».
+    Options,
+    /// Clic sur l'entrée de menu contenant ce texte.
+    MenuItem(String),
+    /// Affiche le contenu du presse-papiers (vérification de la copie).
+    Clip,
+    /// Clic sur « Copier » dans la fenêtre des propriétés.
+    PropsCopy,
     Shot(String),
     Wait(u64),
     Quit,
@@ -118,8 +162,15 @@ pub fn parse_script(s: &str) -> anyhow::Result<Vec<Action>> {
                 "wheel" => Action::Wheel(num(1)?),
                 "sidewheel" => Action::SideWheel(num(1)?),
                 "ctrlwheel" => Action::CtrlWheel(num(1)?),
+                "shiftwheel" => Action::ShiftWheel(num(1)?),
                 "mouselink" => Action::MouseLink(num(1)? as usize),
                 "drag" => Action::Drag(num(1)?, num(2)?, num(3)?, num(4)?),
+                "select" => Action::Select(num(1)?, num(2)?, num(3)?, num(4)?),
+                "rclick" => Action::RClick(num(1)?, num(2)?),
+                "options" => Action::Options,
+                "menu" => Action::MenuItem(parts.get(1).unwrap_or(&"").to_string()),
+                "clip" => Action::Clip,
+                "propscopy" => Action::PropsCopy,
                 "shot" => Action::Shot(parts.get(1).unwrap_or(&"capture").to_string()),
                 "wait" => Action::Wait(num(1)? as u64),
                 "quit" => Action::Quit,
@@ -175,6 +226,18 @@ pub struct App {
     dragging: bool,
     hover_link: bool,
     wheel_acc: f32,
+    rotation: u32,
+    selection: Option<Selection>,
+    /// Clic gauche en cours sur la page : position et caractère d'ancrage.
+    sel_press: Option<((f32, f32), Option<usize>)>,
+    selecting: bool,
+    menu: Option<Menu>,
+    props: Option<Vec<String>>,
+    clipboard: Option<arboard::Clipboard>,
+    toast: Option<(String, Instant)>,
+    /// Textes de l'interface déjà rendus (texte, taille).
+    ui_text: HashMap<(String, u32), Tex>,
+    cursor_icon: CursorIcon,
 
     // Textures GPU.
     pages: HashMap<usize, (f32, Tex)>,
@@ -208,7 +271,7 @@ impl App {
             origin: (0.0, 0.0),
             back: Vec::new(),
             forward: Vec::new(),
-            sidebar: true,
+            sidebar: false, // masqué par défaut (F9)
             sidebar_scroll: 0.0,
             thumb_y: Vec::new(),
             status: true,
@@ -219,6 +282,16 @@ impl App {
             dragging: false,
             hover_link: false,
             wheel_acc: 0.0,
+            rotation: 0,
+            selection: None,
+            sel_press: None,
+            selecting: false,
+            menu: None,
+            props: None,
+            clipboard: None,
+            toast: None,
+            ui_text: HashMap::new(),
+            cursor_icon: CursorIcon::Default,
             pages: HashMap::new(),
             tiles: HashMap::new(),
             thumbs: HashMap::new(),
@@ -266,8 +339,13 @@ impl App {
     }
 
     /// (échelle « ajustée », zoom effectif, échelle d'affichage) d'une page.
+    /// Taille de la page telle qu'affichée (rotation appliquée).
+    fn disp_size(&self, page: usize) -> greedpdf_core::SizePt {
+        layout::rotated(self.engine().page_size(page), self.rotation)
+    }
+
     fn scales(&self, page: usize) -> (f32, f32, f32) {
-        let size = self.engine().page_size(page);
+        let size = self.disp_size(page);
         let vp = self.viewport();
         let fit = layout::fit_scale(size, vp);
         let zoom = match self.mode {
@@ -281,10 +359,7 @@ impl App {
     /// Rectangle de la page courante dans la fenêtre.
     fn page_rect(&self) -> Rect {
         let (_, _, d) = self.scales(self.current);
-        let (pw, ph) = page_px(self.engine().page_size(self.current), d);
-        let a = self.area();
-        let o = layout::place(pw as f32, ph as f32, self.viewport(), self.origin);
-        Rect::new(a.x + o.0, a.y + o.1, pw as f32, ph as f32)
+        self.page_rect_with(d)
     }
 
     /// Recale la position (centrage, bords) et transmet la vue au moteur.
@@ -293,9 +368,15 @@ impl App {
             return;
         }
         let (_, zoom, d) = self.scales(self.current);
-        let (pw, ph) = page_px(self.engine().page_size(self.current), d);
+        let (pw, ph) = page_px(self.disp_size(self.current), d);
         self.origin = layout::place(pw as f32, ph as f32, self.viewport(), self.origin);
-        let view = View { current: self.current, viewport: self.viewport(), zoom, origin: self.origin };
+        let view = View {
+            current: self.current,
+            viewport: self.viewport(),
+            zoom,
+            origin: self.origin,
+            rotation: self.rotation,
+        };
         self.engine().set_view(view);
         self.request_redraw();
     }
@@ -331,6 +412,7 @@ impl App {
     }
 
     fn after_page_change(&mut self) {
+        self.selection = None;
         self.reveal_thumb(self.current);
         self.update_view();
     }
@@ -412,7 +494,7 @@ impl App {
     }
 
     fn page_rect_with(&self, d: f32) -> Rect {
-        let (pw, ph) = page_px(self.engine().page_size(self.current), d);
+        let (pw, ph) = page_px(self.disp_size(self.current), d);
         let a = self.area();
         let o = layout::place(pw as f32, ph as f32, self.viewport(), self.origin);
         Rect::new(a.x + o.0, a.y + o.1, pw as f32, ph as f32)
@@ -431,8 +513,7 @@ impl App {
         if !r.contains(x, y) || x < self.sidebar_width() {
             return None;
         }
-        let (_, _, d) = self.scales(self.current);
-        let (px, py) = ((x - r.x) / d, (y - r.y) / d);
+        let (px, py) = self.screen_to_page(x, y);
         self.engine()
             .links(self.current)?
             .into_iter()
@@ -448,6 +529,276 @@ impl App {
         } else if let Some(t) = self.link_at(x, y) {
             self.jump(t.page, t.y, "lien");
         }
+    }
+
+    // ------------------------------------------------- rotation et repères
+
+    /// Point de l'écran → point de la page non tournée, en points PDF.
+    fn screen_to_page(&self, x: f32, y: f32) -> (f32, f32) {
+        let r = self.page_rect();
+        let (_, _, d) = self.scales(self.current);
+        let size = self.engine().page_size(self.current);
+        let (ux, uy) = layout::unrot_point(x - r.x, y - r.y, size.w * d, size.h * d, self.rotation);
+        (ux / d, uy / d)
+    }
+
+    /// Rectangle de la page non tournée (points PDF) → rectangle à l'écran.
+    fn page_to_screen(&self, x0: f32, y0: f32, x1: f32, y1: f32) -> Rect {
+        let r = self.page_rect();
+        let (_, _, d) = self.scales(self.current);
+        let size = self.engine().page_size(self.current);
+        let (a, b, c, e) = layout::rot_rect((x0 * d, y0 * d, x1 * d, y1 * d), size.w * d, size.h * d, self.rotation);
+        Rect::new(r.x + a, r.y + b, c - a, e - b)
+    }
+
+    /// Pivote l'affichage d'un quart de tour (+90 : sens horaire).
+    fn rotate(&mut self, delta: i32) {
+        self.rotation = ((self.rotation as i32 + delta).rem_euclid(360)) as u32;
+        self.origin = (0.0, 0.0);
+        self.tiles.clear();
+        self.start_nav(format!("rotation {}°", self.rotation));
+        self.update_view();
+    }
+
+    // ------------------------------------------------- sélection et copie
+
+    fn toast(&mut self, msg: impl Into<String>) {
+        self.toast = Some((msg.into(), Instant::now()));
+        self.request_redraw();
+    }
+
+    fn page_text(&self) -> Option<Arc<PageText>> {
+        self.engine().text(self.current)
+    }
+
+    fn select_all(&mut self) {
+        match self.page_text() {
+            Some(t) if !t.chars.is_empty() => {
+                self.selection = Some(Selection { page: self.current, a: 0, b: t.chars.len() - 1 });
+                self.request_redraw();
+            }
+            Some(_) => self.toast("Aucun texte sur cette page"),
+            None => self.toast("Texte de la page pas encore extrait"),
+        }
+    }
+
+    fn clipboard(&mut self) -> Option<&mut arboard::Clipboard> {
+        if self.clipboard.is_none() {
+            match arboard::Clipboard::new() {
+                Ok(c) => self.clipboard = Some(c),
+                Err(e) => {
+                    self.toast(format!("Presse-papiers indisponible : {e}"));
+                    return None;
+                }
+            }
+        }
+        self.clipboard.as_mut()
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let sel = self.selection?;
+        let t = self.engine().text(sel.page)?;
+        Some(t.extract(sel.a.min(sel.b), sel.a.max(sel.b)))
+    }
+
+    fn copy_text(&mut self) {
+        let Some(text) = self.selected_text() else {
+            self.toast("Rien de sélectionné");
+            return;
+        };
+        let n = text.chars().count();
+        let res = self.clipboard().map(|c| c.set_text(text));
+        match res {
+            Some(Ok(())) => self.toast(format!("{n} caractères copiés")),
+            Some(Err(e)) => self.toast(format!("Copie impossible : {e}")),
+            None => {}
+        }
+    }
+
+    fn copy_image(&mut self) {
+        let Some(img) = self.engine().get(ImgKey::L0(self.current)) else {
+            self.toast("Page pas encore rendue");
+            return;
+        };
+        let px = rotate_pixels(&img.pixels, self.rotation);
+        let (w, h) = (px.w, px.h);
+        let data = arboard::ImageData { width: w as usize, height: h as usize, bytes: px.data.into() };
+        let res = self.clipboard().map(|c| c.set_image(data));
+        match res {
+            Some(Ok(())) => self.toast(format!("Image de la page copiée ({w}×{h})")),
+            Some(Err(e)) => self.toast(format!("Copie impossible : {e}")),
+            None => {}
+        }
+    }
+
+    /// Impression : envoie le fichier à l'imprimante par défaut (CUPS, `lp`).
+    fn print(&mut self) {
+        let path = self.src.path.clone();
+        let proxy = self.proxy.clone();
+        self.toast("Envoi à l'imprimante…");
+        std::thread::spawn(move || {
+            let msg = match std::process::Command::new("lp").arg("--").arg(&path).output() {
+                Ok(o) if o.status.success() => {
+                    format!("Impression envoyée : {}", String::from_utf8_lossy(&o.stdout).trim())
+                }
+                Ok(o) => format!("Impression impossible : {}", String::from_utf8_lossy(&o.stderr).trim()),
+                Err(e) => format!("Impression impossible (lp introuvable ?) : {e}"),
+            };
+            let _ = proxy.send_event(UserEvent::Toast(msg));
+        });
+    }
+
+    fn open_properties(&mut self) {
+        let e = self.engine();
+        let path = &self.src.path;
+        let size = e.page_size(self.current);
+        let st = e.stats();
+        let mut lines = vec![
+            format!("Fichier : {}", path.file_name().unwrap_or_default().to_string_lossy()),
+            format!(
+                "Dossier : {}",
+                std::fs::canonicalize(path)
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.display().to_string()))
+                    .unwrap_or_default()
+            ),
+            format!(
+                "Taille : {} Mo ({} octets)",
+                format!("{:.1}", self.src.bytes.len() as f64 / 1e6).replace('.', ","),
+                self.src.bytes.len()
+            ),
+            format!("Pages : {}", e.page_count),
+        ];
+        for (k, v) in e.metadata() {
+            let v = if k.ends_with(" le") { pdf_date(&v) } else { v };
+            lines.push(format!("{k} : {v}"));
+        }
+        lines.push(format!(
+            "Format de la page {} : {:.0} × {:.0} pt ({:.0} × {:.0} mm)",
+            self.current + 1,
+            size.w,
+            size.h,
+            size.w / 72.0 * 25.4,
+            size.h / 72.0 * 25.4
+        ));
+        if let Some(n) = e.link_count() {
+            lines.push(format!("Liens internes : {n}"));
+        }
+        let chars: usize = (0..e.page_count).filter_map(|p| e.text(p)).map(|t| t.chars.len()).sum();
+        lines.push(format!("Caractères (texte extrait) : {chars}"));
+        lines.push("Rendu : hayro (pages), MuPDF (tuiles, liens, texte)".to_string());
+        let s = format!("{:.2}", st.s_target).trim_end_matches('0').trim_end_matches('.').replace('.', ",");
+        lines.push(format!(
+            "Préchargement : {}/{} pages, S {} ({}/{}), cache {} Go",
+            st.l0_any,
+            st.pages,
+            s,
+            st.l0_target,
+            st.pages,
+            format!("{:.1}", st.cache_bytes as f64 / 1e9).replace('.', ",")
+        ));
+        self.props = Some(lines);
+        self.menu = None;
+        self.request_redraw();
+    }
+
+    fn exec(&mut self, cmd: Cmd) {
+        self.menu = None;
+        match cmd {
+            Cmd::CopyImage => self.copy_image(),
+            Cmd::CopyText => self.copy_text(),
+            Cmd::SelectAll => self.select_all(),
+            Cmd::Print => self.print(),
+            Cmd::Fullscreen => self.toggle_fullscreen(),
+            Cmd::RotateRight => self.rotate(90),
+            Cmd::RotateLeft => self.rotate(-90),
+            Cmd::Properties => self.open_properties(),
+            Cmd::Sidebar => self.toggle_sidebar(),
+        }
+        self.request_redraw();
+    }
+
+    // ---------------------------------------------------------- menus
+
+    fn text_width(&self, s: &str, px: f32) -> f32 {
+        self.text.as_ref().map_or(s.len() as f32 * px * 0.55, |t| t.width(s, px))
+    }
+
+    /// Bouton « Options », en haut à droite de la zone des pages.
+    fn options_button(&self) -> Rect {
+        let px = self.text_px();
+        let a = self.area();
+        let (w, h) = (self.text_width("Options", px) + px * 1.6, px * 1.9);
+        Rect::new((a.x + a.w - w - 12.0).round(), 12.0, w.round(), h.round())
+    }
+
+    fn open_context_menu(&mut self, x: f32, y: f32) {
+        let mut items = Vec::new();
+        if self.selection.is_some() {
+            items.push(("Copier le texte (Ctrl+C)".to_string(), Cmd::CopyText));
+        }
+        items.push(("Copier l'image de la page".to_string(), Cmd::CopyImage));
+        items.push(("Tout sélectionner (Ctrl+A)".to_string(), Cmd::SelectAll));
+        self.menu = Some(Menu { x, y, items, hover: None });
+        self.request_redraw();
+    }
+
+    fn open_options_menu(&mut self) {
+        let b = self.options_button();
+        let items = vec![
+            ("Imprimer (imprimante par défaut)".to_string(), Cmd::Print),
+            ("Plein écran (F11)".to_string(), Cmd::Fullscreen),
+            ("Pivoter à droite (R)".to_string(), Cmd::RotateRight),
+            ("Pivoter à gauche (E)".to_string(), Cmd::RotateLeft),
+            ("Volet des miniatures (F9)".to_string(), Cmd::Sidebar),
+            ("Propriétés".to_string(), Cmd::Properties),
+        ];
+        let w = self.menu_width(&items);
+        self.menu = Some(Menu { x: b.x + b.w - w, y: b.y + b.h + 4.0, items, hover: None });
+        self.request_redraw();
+    }
+
+    fn menu_width(&self, items: &[(String, Cmd)]) -> f32 {
+        let px = self.text_px();
+        items.iter().map(|(l, _)| self.text_width(l, px)).fold(0.0, f32::max) + 2.0 * px
+    }
+
+    /// Rectangle du menu (borné à la fenêtre) et hauteur d'une entrée.
+    fn menu_geom(&self, m: &Menu) -> (Rect, f32) {
+        let px = self.text_px();
+        let ih = (px * 1.9).round();
+        let w = self.menu_width(&m.items).round();
+        let h = ih * m.items.len() as f32 + 8.0;
+        let (ww, wh) = self.gpu.as_ref().map_or((1, 1), |g| g.size());
+        let x = m.x.min(ww as f32 - w - 4.0).max(0.0).round();
+        let y = m.y.min(wh as f32 - h - 4.0).max(0.0).round();
+        (Rect::new(x, y, w, h), ih)
+    }
+
+    fn menu_item_at(&self, x: f32, y: f32) -> Option<usize> {
+        let m = self.menu.as_ref()?;
+        let (r, ih) = self.menu_geom(m);
+        if !r.contains(x, y) {
+            return None;
+        }
+        let i = ((y - r.y - 4.0) / ih).floor();
+        (i >= 0.0 && (i as usize) < m.items.len()).then_some(i as usize)
+    }
+
+    /// Fenêtre des propriétés : cadre, hauteur de ligne, boutons Copier et Fermer.
+    fn props_geom(&self, lines: &[String]) -> (Rect, f32, Rect, Rect) {
+        let px = self.text_px();
+        let lh = (px * 1.6).round();
+        let w = lines.iter().map(|l| self.text_width(l, px)).fold(0.0, f32::max) + 3.0 * px;
+        let bh = (px * 2.0).round();
+        let h = lh * lines.len() as f32 + bh + 3.0 * px;
+        let (ww, wh) = self.gpu.as_ref().map_or((1, 1), |g| g.size());
+        let r = Rect::new(((ww as f32 - w) / 2.0).round(), ((wh as f32 - h) / 2.0).round(), w.round(), h.round());
+        let bw = self.text_width("Copier", px).max(self.text_width("Fermer", px)) + 2.0 * px;
+        let by = r.y + r.h - bh - px;
+        let close = Rect::new((r.x + r.w - bw - px).round(), by, bw.round(), bh);
+        let copy = Rect::new((close.x - bw - px * 0.6).round(), by, bw.round(), bh);
+        (r, lh, copy, close)
     }
 
     // ---------------------------------------------------------------- volet
@@ -526,6 +877,16 @@ impl App {
             self.request_redraw();
             return;
         }
+        // Échap : ferme d'abord les fenêtres, menus et la sélection.
+        if logical == Key::Named(NamedKey::Escape)
+            && (self.props.is_some() || self.menu.is_some() || self.selection.is_some())
+        {
+            if self.props.take().is_none() && self.menu.take().is_none() {
+                self.selection = None;
+            }
+            self.request_redraw();
+            return;
+        }
         let half = self.area().h * 0.1;
         let last = self.engine().page_count - 1;
         // Ctrl+0 sur la touche physique (sur AZERTY, la touche logique est « à »).
@@ -557,6 +918,10 @@ impl App {
                     }
             }
             Key::Character(c) if ctrl && c.eq_ignore_ascii_case("w") => el.exit(),
+            Key::Character(c) if ctrl && c.eq_ignore_ascii_case("a") => self.select_all(),
+            Key::Character(c) if ctrl && c.eq_ignore_ascii_case("c") => self.copy_text(),
+            Key::Character("r" | "R") if !ctrl => self.rotate(90),
+            Key::Character("e" | "E") if !ctrl => self.rotate(-90),
             Key::Character(c) if ctrl && c.eq_ignore_ascii_case("g") => self.open_goto(String::new()),
             Key::Character(c) if !ctrl && c.chars().all(|c| c.is_ascii_digit()) => self.open_goto(c.to_string()),
             Key::Character("g") => self.open_goto(String::new()),
@@ -604,14 +969,18 @@ impl App {
             self.request_redraw();
             return;
         }
-        if self.modifiers.control_key() {
+        if self.menu.is_some() || self.props.is_some() {
+            return;
+        }
+        if self.modifiers.control_key() || self.modifiers.shift_key() {
+            // Maj+molette (et Ctrl+molette) : zoom autour du curseur.
             let notches = if lines { dy } else { dy / 120.0 };
             if notches != 0.0 {
                 self.zoom_by(ZOOM_STEP.powf(notches.clamp(-3.0, 3.0)), Some((cx, cy)));
             }
             return;
         }
-        if self.page_fits() && !self.modifiers.shift_key() {
+        if self.page_fits() {
             // Page entière visible : la molette tourne les pages.
             self.wheel_acc += if lines { dy } else { dy / 120.0 };
             while self.wheel_acc >= 1.0 {
@@ -626,46 +995,152 @@ impl App {
         }
         let step = self.area().h * 0.15;
         let (sx, sy) = if lines { (-dx * step, -dy * step) } else { (-dx, -dy) };
-        if self.modifiers.shift_key() { self.scroll_by(sy, sx) } else { self.scroll_by(sx, sy) }
+        self.scroll_by(sx, sy)
     }
 
     fn on_cursor(&mut self, x: f32, y: f32) {
         self.cursor = (x, y);
+        // Survol d'un menu.
+        if self.menu.is_some() {
+            let h = self.menu_item_at(x, y);
+            if let Some(m) = self.menu.as_mut()
+                && m.hover != h {
+                    m.hover = h;
+                    self.request_redraw();
+                }
+            self.set_cursor(CursorIcon::Default);
+            return;
+        }
+        // Glisser au clic droit : déplacement de la vue.
         if let Some((p0, o0)) = self.press {
-            if p0.0 >= self.sidebar_width() {
-                if !self.dragging && ((x - p0.0).powi(2) + (y - p0.1).powi(2)) > 16.0 {
-                    self.dragging = true;
-                }
-                if self.dragging {
-                    self.origin = (o0.0 + x - p0.0, o0.1 + y - p0.1);
-                    self.update_view();
-                }
+            if !self.dragging && ((x - p0.0).powi(2) + (y - p0.1).powi(2)) > 16.0 {
+                self.dragging = true;
+            }
+            if self.dragging {
+                self.set_cursor(CursorIcon::Grabbing);
+                self.origin = (o0.0 + x - p0.0, o0.1 + y - p0.1);
+                self.update_view();
             }
             return;
         }
-        let over = self.engine.is_some() && self.link_at(x, y).is_some();
-        if over != self.hover_link {
-            self.hover_link = over;
+        // Glisser au clic gauche : sélection de texte.
+        if let Some((p0, anchor)) = self.sel_press {
+            if !self.selecting && ((x - p0.0).powi(2) + (y - p0.1).powi(2)) > 16.0 {
+                self.selecting = true;
+            }
+            if self.selecting
+                && let (Some(t), Some(a)) = (self.page_text(), anchor) {
+                    let (px, py) = self.screen_to_page(x, y);
+                    if let Some(b) = t.hit(px, py, true) {
+                        let sel = Selection { page: self.current, a, b };
+                        if self.selection != Some(sel) {
+                            self.selection = Some(sel);
+                            self.request_redraw();
+                        }
+                    }
+                }
+            return;
+        }
+        if self.engine.is_none() || self.props.is_some() {
+            return;
+        }
+        let icon = if self.options_button().contains(x, y) || x < self.sidebar_width() {
+            CursorIcon::Default
+        } else if self.link_at(x, y).is_some() {
+            CursorIcon::Pointer
+        } else if self.page_rect().contains(x, y)
+            && self.page_text().is_some_and(|t| {
+                let (px, py) = self.screen_to_page(x, y);
+                t.hit(px, py, false).is_some()
+            })
+        {
+            CursorIcon::Text
+        } else {
+            CursorIcon::Default
+        };
+        self.hover_link = icon == CursorIcon::Pointer;
+        self.set_cursor(icon);
+    }
+
+    fn set_cursor(&mut self, icon: CursorIcon) {
+        if icon != self.cursor_icon {
+            self.cursor_icon = icon;
             if let Some(g) = &self.gpu {
-                g.window.set_cursor(if over { CursorIcon::Pointer } else { CursorIcon::Default });
+                g.window.set_cursor(icon);
             }
         }
     }
 
     /// Bouton de souris (événement réel ou action du script).
     fn mouse_button(&mut self, button: MouseButton, state: ElementState) {
+        let (x, y) = self.cursor;
         match (button, state) {
             (MouseButton::Left, ElementState::Pressed) => {
+                // Fenêtre des propriétés : boutons, ou clic dehors pour fermer.
+                if let Some(lines) = self.props.clone() {
+                    let (r, _, copy, close) = self.props_geom(&lines);
+                    if copy.contains(x, y) {
+                        let res = self.clipboard().map(|c| c.set_text(lines.join("\n")));
+                        if let Some(Ok(())) = res {
+                            self.toast("Propriétés copiées");
+                        }
+                    } else if close.contains(x, y) || !r.contains(x, y) {
+                        self.props = None;
+                    }
+                    self.request_redraw();
+                    return;
+                }
+                // Menu ouvert : entrée choisie, ou clic dehors pour fermer.
+                if self.menu.is_some() {
+                    match self.menu_item_at(x, y) {
+                        Some(i) => {
+                            let cmd = self.menu.as_ref().unwrap().items[i].1;
+                            self.exec(cmd);
+                        }
+                        None => self.menu = None,
+                    }
+                    self.request_redraw();
+                    return;
+                }
+                if self.options_button().contains(x, y) {
+                    self.open_options_menu();
+                    return;
+                }
+                if x >= self.sidebar_width() {
+                    let anchor = self.page_text().and_then(|t| {
+                        let (px, py) = self.screen_to_page(x, y);
+                        t.hit(px, py, true)
+                    });
+                    self.sel_press = Some(((x, y), anchor));
+                    self.selecting = false;
+                } else {
+                    self.click(x, y); // volet des miniatures
+                }
+            }
+            (MouseButton::Left, ElementState::Released) => {
+                let was_selecting = self.selecting;
+                let pressed = self.sel_press.take().is_some();
+                self.selecting = false;
+                if pressed && !was_selecting {
+                    // Simple clic sur la page : lien, sinon efface la sélection.
+                    if self.selection.take().is_some() {
+                        self.request_redraw();
+                    }
+                    self.click(x, y);
+                }
+            }
+            (MouseButton::Right, ElementState::Pressed) => {
+                self.menu = None;
                 self.press = Some((self.cursor, self.origin));
                 self.dragging = false;
             }
-            (MouseButton::Left, ElementState::Released) => {
+            (MouseButton::Right, ElementState::Released) => {
                 let was_drag = self.dragging;
                 self.press = None;
                 self.dragging = false;
-                if !was_drag {
-                    let (x, y) = self.cursor;
-                    self.click(x, y);
+                self.set_cursor(CursorIcon::Default);
+                if !was_drag && x >= self.sidebar_width() && self.props.is_none() {
+                    self.open_context_menu(x, y);
                 }
             }
             (MouseButton::Back, ElementState::Pressed) => self.history(true),
@@ -697,7 +1172,9 @@ impl App {
             let ts = layout::tile_scale(fit, level);
             let a = self.area();
             let k = d / ts;
-            for (tx, ty) in layout::visible_tiles(size, self.viewport(), (r.x - a.x, r.y - a.y), d, ts, 0) {
+            let rot = self.rotation;
+            let (tpw, tph) = page_px(size, ts);
+            for (tx, ty) in layout::visible_tiles(size, self.viewport(), (r.x - a.x, r.y - a.y), d, ts, rot, 0) {
                 let key = ImgKey::Tile { page: cur, level, tx, ty };
                 if !self.tiles.contains_key(&key)
                     && let Some(img) = self.engine().get(key) {
@@ -705,11 +1182,15 @@ impl App {
                         self.tiles.insert(key, g.upload(img.pixels.w, img.pixels.h, &img.pixels.data, false));
                     }
                 if self.tiles.contains_key(&key) {
+                    // Rectangle de la tuile dans la page non tournée → affiché.
                     let t = layout::tile_rect(size, ts, tx, ty);
-                    tile_draws.push((
-                        key,
-                        Rect::new(r.x + t.x as f32 * k, r.y + t.y as f32 * k, t.w as f32 * k, t.h as f32 * k),
-                    ));
+                    let (x0, y0, x1, y1) = layout::rot_rect(
+                        (t.x as f32, t.y as f32, (t.x + t.w as i32) as f32, (t.y + t.h as i32) as f32),
+                        tpw as f32,
+                        tph as f32,
+                        rot,
+                    );
+                    tile_draws.push((key, Rect::new(r.x + x0 * k, r.y + y0 * k, (x1 - x0) * k, (y1 - y0) * k)));
                 } else {
                     tiles_missing += 1;
                 }
@@ -719,20 +1200,27 @@ impl App {
 
         self.update_sidebar_textures();
         self.update_overlay_textures();
+        self.prepare_ui_texts();
+        let sel_rects = self.selection_rects();
 
         // Liste des éléments à dessiner.
         let g = self.gpu.as_ref().unwrap();
         let mut items: Vec<Draw> = Vec::new();
         let page_shown = self.pages.contains_key(&cur);
         match self.pages.get(&cur) {
-            Some((_, tex)) => items.push(Draw { tex, dest: r, tint: WHITE }),
-            None => items.push(Draw { tex: g.white(), dest: r, tint: [0.85, 0.85, 0.85, 1.0] }),
+            Some((_, tex)) => items.push(Draw { tex, dest: r, tint: WHITE, rot: self.rotation }),
+            None => items.push(Draw { tex: g.white(), dest: r, tint: [0.85, 0.85, 0.85, 1.0], rot: 0 }),
         }
         for (key, dest) in &tile_draws {
-            items.push(Draw { tex: &self.tiles[key], dest: *dest, tint: WHITE });
+            items.push(Draw { tex: &self.tiles[key], dest: *dest, tint: WHITE, rot: self.rotation });
+        }
+        // Sélection : bleu translucide (prémultiplié).
+        for dest in &sel_rects {
+            items.push(Draw { tex: g.white(), dest: *dest, tint: [0.05, 0.13, 0.32, 0.38], rot: 0 });
         }
         self.push_sidebar(&mut items);
         self.push_overlay(&mut items);
+        self.push_ui(&mut items);
         g.draw(&items);
 
         // Mesures de latence (SPEC.md §7, A2–A5).
@@ -774,6 +1262,124 @@ impl App {
         true
     }
 
+    /// Rectangles à l'écran de la sélection (un par morceau de ligne).
+    fn selection_rects(&self) -> Vec<Rect> {
+        let Some(sel) = self.selection.filter(|s| s.page == self.current) else { return Vec::new() };
+        let Some(t) = self.page_text() else { return Vec::new() };
+        let (a, b) = (sel.a.min(sel.b), sel.a.max(sel.b).min(t.chars.len().saturating_sub(1)));
+        let mut out = Vec::new();
+        let mut run: Option<(f32, f32, f32, f32)> = None;
+        for ch in &t.chars[a..=b] {
+            let r = run.get_or_insert((ch.x0, ch.y0, ch.x1, ch.y1));
+            *r = (r.0.min(ch.x0), r.1.min(ch.y0), r.2.max(ch.x1), r.3.max(ch.y1));
+            if ch.eol {
+                let (x0, y0, x1, y1) = run.take().unwrap();
+                out.push(self.page_to_screen(x0, y0, x1, y1));
+            }
+        }
+        if let Some((x0, y0, x1, y1)) = run {
+            out.push(self.page_to_screen(x0, y0, x1, y1));
+        }
+        out
+    }
+
+    /// Textes de l'interface affichés cette frame (bouton, menu, propriétés, message).
+    fn ui_strings(&self) -> Vec<(String, f32)> {
+        let px = self.text_px();
+        let mut v = vec![("Options".to_string(), px)];
+        if let Some(m) = &self.menu {
+            v.extend(m.items.iter().map(|(l, _)| (l.clone(), px)));
+        }
+        if let Some(lines) = &self.props {
+            v.extend(lines.iter().map(|l| (l.clone(), px)));
+            v.push(("Propriétés du document".to_string(), px * 1.2));
+            v.push(("Copier".to_string(), px));
+            v.push(("Fermer".to_string(), px));
+        }
+        if let Some((t, _)) = &self.toast {
+            v.push((t.clone(), px));
+        }
+        v
+    }
+
+    fn prepare_ui_texts(&mut self) {
+        if self.toast.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(3)) {
+            self.toast = None;
+        }
+        let Some(text) = &self.text else { return };
+        for (s, px) in self.ui_strings() {
+            let key = (s, px.round() as u32);
+            if !self.ui_text.contains_key(&key) {
+                let img = text.render(&key.0, px);
+                let tex = self.gpu.as_ref().unwrap().upload(img.w, img.h, &img.data, false);
+                self.ui_text.insert(key, tex);
+            }
+        }
+        if self.ui_text.len() > 256 {
+            self.ui_text.clear(); // textes devenus inutiles (messages, propriétés)
+        }
+    }
+
+    fn ui_tex(&self, s: &str, px: f32) -> Option<&Tex> {
+        self.ui_text.get(&(s.to_string(), px.round() as u32))
+    }
+
+    fn push_ui<'a>(&'a self, items: &mut Vec<Draw<'a>>) {
+        let g = self.gpu.as_ref().unwrap();
+        let px = self.text_px();
+        let plain = |tex: &'a Tex, dest: Rect, tint: [f32; 4]| Draw { tex, dest, tint, rot: 0 };
+        let label = |items: &mut Vec<Draw<'a>>, s: &str, px: f32, x: f32, y: f32, tint: [f32; 4]| {
+            if let Some(t) = self.ui_tex(s, px) {
+                items.push(plain(t, Rect::new(x.round(), y.round(), t.w as f32, t.h as f32), tint));
+            }
+        };
+        // Bouton « Options ».
+        let b = self.options_button();
+        let hover = b.contains(self.cursor.0, self.cursor.1) || self.menu.as_ref().is_some_and(|m| m.items.len() == 6);
+        items.push(plain(g.white(), b, if hover { [0.2, 0.2, 0.23, 0.95] } else { [0.08, 0.08, 0.09, 0.8] }));
+        label(items, "Options", px, b.x + px * 0.8, b.y + (b.h - px * 1.3) / 2.0, [0.92, 0.92, 0.92, 0.92]);
+        // Menu.
+        if let Some(m) = &self.menu {
+            let (r, ih) = self.menu_geom(m);
+            items.push(plain(g.white(), Rect::new(r.x - 1.0, r.y - 1.0, r.w + 2.0, r.h + 2.0), [0.3, 0.3, 0.33, 1.0]));
+            items.push(plain(g.white(), r, [0.12, 0.12, 0.14, 1.0]));
+            for (i, (l, _)) in m.items.iter().enumerate() {
+                let y = r.y + 4.0 + i as f32 * ih;
+                if m.hover == Some(i) {
+                    items.push(plain(g.white(), Rect::new(r.x + 2.0, y, r.w - 4.0, ih), [0.16, 0.36, 0.7, 1.0]));
+                }
+                label(items, l, px, r.x + px, y + (ih - px * 1.3) / 2.0, WHITE);
+            }
+        }
+        // Fenêtre des propriétés.
+        if let Some(lines) = &self.props {
+            let (ww, wh) = g.size();
+            items.push(plain(g.white(), Rect::new(0.0, 0.0, ww as f32, wh as f32), [0.0, 0.0, 0.0, 0.45]));
+            let (r, lh, copy, close) = self.props_geom(lines);
+            items.push(plain(g.white(), r, [0.12, 0.12, 0.14, 1.0]));
+            label(items, "Propriétés du document", px * 1.2, r.x + px * 1.5, r.y + px * 0.5, WHITE);
+            for (i, l) in lines.iter().enumerate() {
+                label(items, l, px, r.x + px * 1.5, r.y + px * 2.2 + i as f32 * lh, [0.9, 0.9, 0.9, 0.9]);
+            }
+            for (bt, rect) in [("Copier", copy), ("Fermer", close)] {
+                let hv = rect.contains(self.cursor.0, self.cursor.1);
+                items.push(plain(g.white(), rect, if hv { [0.16, 0.36, 0.7, 1.0] } else { [0.22, 0.22, 0.26, 1.0] }));
+                let w = self.text_width(bt, px);
+                label(items, bt, px, rect.x + (rect.w - w) / 2.0, rect.y + (rect.h - px * 1.3) / 2.0, WHITE);
+            }
+        }
+        // Message temporaire.
+        if let Some((t, _)) = &self.toast
+            && let Some(tex) = self.ui_tex(t, px) {
+                let a = self.area();
+                let (w, h) = (tex.w as f32 + 2.0 * px, tex.h as f32 + px);
+                let x = (a.x + (a.w - w) / 2.0).round();
+                let y = (a.h - h - px * 3.0).round();
+                items.push(plain(g.white(), Rect::new(x, y, w, h), [0.1, 0.1, 0.12, 0.92]));
+                items.push(plain(tex, Rect::new(x + px, y + px / 2.0, tex.w as f32, tex.h as f32), WHITE));
+            }
+    }
+
     fn update_sidebar_textures(&mut self) {
         if !self.sidebar || self.text.is_none() && self.thumb_y.is_empty() {
             return;
@@ -813,7 +1419,7 @@ impl App {
         let g = self.gpu.as_ref().unwrap();
         let w = self.sidebar_width();
         let h = self.area().h;
-        items.push(Draw { tex: g.white(), dest: Rect::new(0.0, 0.0, w, h), tint: [0.09, 0.09, 0.1, 1.0] });
+        items.push(Draw { tex: g.white(), dest: Rect::new(0.0, 0.0, w, h), tint: [0.09, 0.09, 0.1, 1.0], rot: 0 });
         let tw = self.opts.config.thumb_width as f32;
         let (first, last) = self.visible_thumbs(h);
         for p in first..=last {
@@ -823,11 +1429,11 @@ impl App {
             if p == self.current {
                 let m = 6.0;
                 let hl = Rect::new(dest.x - m, dest.y - m, dest.w + 2.0 * m, self.thumb_y[p + 1] - self.thumb_y[p] - SIDEBAR_PAD + 2.0 * m);
-                items.push(Draw { tex: g.white(), dest: hl, tint: [0.16, 0.36, 0.7, 1.0] });
+                items.push(Draw { tex: g.white(), dest: hl, tint: [0.16, 0.36, 0.7, 1.0], rot: 0 });
             }
             match self.thumbs.get(&p) {
-                Some(t) => items.push(Draw { tex: t, dest, tint: WHITE }),
-                None => items.push(Draw { tex: g.white(), dest, tint: [0.3, 0.3, 0.32, 1.0] }),
+                Some(t) => items.push(Draw { tex: t, dest, tint: WHITE, rot: 0 }),
+                None => items.push(Draw { tex: g.white(), dest, tint: [0.3, 0.3, 0.32, 1.0], rot: 0 }),
             }
             if let Some(l) = self.labels.get(&p) {
                 let lx = SIDEBAR_PAD + (tw - l.w as f32) / 2.0;
@@ -835,6 +1441,7 @@ impl App {
                     tex: l,
                     dest: Rect::new(lx.round(), (y + th + 2.0).round(), l.w as f32, l.h as f32),
                     tint: [0.85, 0.85, 0.85, 0.85],
+                    rot: 0,
                 });
             }
         }
@@ -892,11 +1499,12 @@ impl App {
         if self.status
             && let Some((_, t)) = &self.status_tex {
                 let bh = t.h as f32 + 10.0;
-                items.push(Draw { tex: g.white(), dest: Rect::new(a.x, a.h - bh, a.w, bh), tint: [0.0, 0.0, 0.0, 0.72] });
+                items.push(Draw { tex: g.white(), dest: Rect::new(a.x, a.h - bh, a.w, bh), tint: [0.0, 0.0, 0.0, 0.72], rot: 0 });
                 items.push(Draw {
                     tex: t,
                     dest: Rect::new(a.x + 12.0, (a.h - bh + 5.0).round(), t.w as f32, t.h as f32),
                     tint: [0.92, 0.92, 0.92, 0.92],
+                    rot: 0,
                 });
             }
         if self.goto.is_some()
@@ -904,8 +1512,8 @@ impl App {
                 let (bw, bh) = (t.w as f32 + 48.0, t.h as f32 + 28.0);
                 let bx = (a.x + (a.w - bw) / 2.0).round();
                 let by = (a.h * 0.75 - bh / 2.0).round();
-                items.push(Draw { tex: g.white(), dest: Rect::new(bx, by, bw, bh), tint: [0.12, 0.12, 0.14, 0.95] });
-                items.push(Draw { tex: t, dest: Rect::new(bx + 24.0, by + 14.0, t.w as f32, t.h as f32), tint: WHITE });
+                items.push(Draw { tex: g.white(), dest: Rect::new(bx, by, bw, bh), tint: [0.12, 0.12, 0.14, 0.95], rot: 0 });
+                items.push(Draw { tex: t, dest: Rect::new(bx + 24.0, by + 14.0, t.w as f32, t.h as f32), tint: WHITE, rot: 0 });
             }
     }
 
@@ -962,7 +1570,7 @@ impl App {
             Action::Sidebar => self.toggle_sidebar(),
             Action::Type(t) => self.open_goto(t),
             Action::KeyPress(k) => self.script_key(el, &k),
-            Action::Wheel(n) | Action::CtrlWheel(n) | Action::SideWheel(n) => {
+            Action::Wheel(n) | Action::CtrlWheel(n) | Action::SideWheel(n) | Action::ShiftWheel(n) => {
                 // Passe par le vrai gestionnaire de molette, curseur placé
                 // au centre de la zone des pages (ou du volet).
                 let a = self.area();
@@ -970,11 +1578,18 @@ impl App {
                 let ctrl = matches!(a_ref, Action::CtrlWheel(_));
                 let (x, y) = if side { (self.sidebar_width() / 2.0, a.h / 2.0) } else { (a.x + a.w / 2.0, a.y + a.h / 2.0) };
                 self.on_cursor(x, y);
+                let shift = matches!(a_ref, Action::ShiftWheel(_));
                 let saved = self.modifiers;
                 if ctrl {
                     self.modifiers = ModifiersState::CONTROL;
                 }
-                self.start_nav(format!("molette {n}{}", if ctrl { " + Ctrl" } else if side { " (volet)" } else { "" }));
+                if shift {
+                    self.modifiers = ModifiersState::SHIFT;
+                }
+                self.start_nav(format!(
+                    "molette {n}{}",
+                    if ctrl { " + Ctrl" } else if shift { " + Maj" } else if side { " (volet)" } else { "" }
+                ));
                 self.on_wheel(MouseScrollDelta::LineDelta(0.0, n));
                 self.modifiers = saved;
             }
@@ -994,15 +1609,70 @@ impl App {
                     self.mouse_button(MouseButton::Left, ElementState::Released);
                 }
             }
-            Action::Drag(x0, y0, x1, y1) => {
-                self.start_nav(format!("glisser {x0},{y0} → {x1},{y1}"));
+            Action::Drag(x0, y0, x1, y1) | Action::Select(x0, y0, x1, y1) => {
+                let button = if matches!(a_ref, Action::Drag(..)) { MouseButton::Right } else { MouseButton::Left };
+                self.start_nav(format!("glisser {button:?} {x0},{y0} → {x1},{y1}"));
                 self.on_cursor(x0, y0);
-                self.mouse_button(MouseButton::Left, ElementState::Pressed);
+                self.mouse_button(button, ElementState::Pressed);
                 for i in 1..=10 {
                     let t = i as f32 / 10.0;
                     self.on_cursor(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t);
                 }
+                self.mouse_button(button, ElementState::Released);
+                if button == MouseButton::Left {
+                    let txt = self.selected_text().unwrap_or_default();
+                    eprintln!("[script] sélection : {} caractères : {:?}", txt.chars().count(), txt.chars().take(80).collect::<String>());
+                }
+            }
+            Action::RClick(x, y) => {
+                self.on_cursor(x, y);
+                self.mouse_button(MouseButton::Right, ElementState::Pressed);
+                self.mouse_button(MouseButton::Right, ElementState::Released);
+                let items: Vec<String> = self.menu.iter().flat_map(|m| m.items.iter().map(|i| i.0.clone())).collect();
+                eprintln!("[script] menu contextuel : {items:?}");
+            }
+            Action::Options => {
+                let b = self.options_button();
+                self.on_cursor(b.x + b.w / 2.0, b.y + b.h / 2.0);
+                self.mouse_button(MouseButton::Left, ElementState::Pressed);
                 self.mouse_button(MouseButton::Left, ElementState::Released);
+                let items: Vec<String> = self.menu.iter().flat_map(|m| m.items.iter().map(|i| i.0.clone())).collect();
+                eprintln!("[script] menu Options : {items:?}");
+            }
+            Action::MenuItem(label) => {
+                let pos = self.menu.as_ref().and_then(|m| {
+                    let i = m.items.iter().position(|(l, _)| l.contains(&label))?;
+                    let (r, ih) = self.menu_geom(m);
+                    Some((r.x + r.w / 2.0, r.y + 4.0 + (i as f32 + 0.5) * ih))
+                });
+                match pos {
+                    Some((x, y)) => {
+                        self.on_cursor(x, y);
+                        self.mouse_button(MouseButton::Left, ElementState::Pressed);
+                        self.mouse_button(MouseButton::Left, ElementState::Released);
+                        eprintln!("[script] menu → « {label} »");
+                    }
+                    None => eprintln!("[script] entrée de menu « {label} » introuvable"),
+                }
+            }
+            Action::Clip => {
+                let (text, image) = match self.clipboard() {
+                    Some(c) => (c.get_text().ok(), c.get_image().ok().map(|i| (i.width, i.height))),
+                    None => (None, None),
+                };
+                eprintln!(
+                    "[script] presse-papiers : texte {:?} ; image {:?}",
+                    text.map(|t| t.chars().take(120).collect::<String>()),
+                    image
+                );
+            }
+            Action::PropsCopy => {
+                if let Some(lines) = self.props.clone() {
+                    let (_, _, copy, _) = self.props_geom(&lines);
+                    self.on_cursor(copy.x + 5.0, copy.y + 5.0);
+                    self.mouse_button(MouseButton::Left, ElementState::Pressed);
+                    self.mouse_button(MouseButton::Left, ElementState::Released);
+                }
             }
             Action::Shot(name) => {
                 self.screenshot(&name);
@@ -1108,7 +1778,7 @@ impl ApplicationHandler<UserEvent> for App {
         let win_w = self.gpu.as_ref().unwrap().size().0 as f32;
         self.opts.config.thumb_width =
             (self.opts.config.thumb_width as f32 * self.scale_factor).max(win_w * 0.065).round() as u32;
-        let view = View { current: self.opts.start_page, viewport: self.viewport(), zoom: 1.0, origin: (0.0, 0.0) };
+        let view = View { current: self.opts.start_page, viewport: self.viewport(), zoom: 1.0, origin: (0.0, 0.0), rotation: 0 };
         match Engine::new(self.src.clone(), self.opts.config.clone(), view, Arc::new(ProxyNotify(self.proxy.clone()))) {
             Ok(e) => {
                 self.current = self.opts.start_page.min(e.page_count - 1);
@@ -1130,6 +1800,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, _: &ActiveEventLoop, ev: UserEvent) {
+
         let cur = self.current;
         match ev {
             UserEvent::Ready(key) => {
@@ -1137,6 +1808,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_redraw();
                 }
             }
+            UserEvent::Toast(msg) => self.toast(msg),
             UserEvent::Thumb(p) => {
                 if self.sidebar && self.engine.is_some() {
                     let (a, b) = self.visible_thumbs(self.area().h);
@@ -1216,3 +1888,65 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 }
+
+/// Image tournée de `rot` degrés (sens horaire), pour la copie de l'image.
+fn rotate_pixels(src: &greedpdf_core::PixelBuf, rot: u32) -> greedpdf_core::PixelBuf {
+    let (w, h) = (src.w as usize, src.h as usize);
+    let mut out = greedpdf_core::PixelBuf::default();
+    match rot % 360 {
+        90 | 270 => out.reset(src.h, src.w),
+        180 => out.reset(src.w, src.h),
+        _ => return src.clone(),
+    }
+    let ow = out.w as usize;
+    for y in 0..h {
+        for x in 0..w {
+            let (nx, ny) = match rot % 360 {
+                90 => (h - 1 - y, x),
+                180 => (w - 1 - x, h - 1 - y),
+                _ => (y, w - 1 - x),
+            };
+            let s = (y * w + x) * 4;
+            let d = (ny * ow + nx) * 4;
+            out.data[d..d + 4].copy_from_slice(&src.data[s..s + 4]);
+        }
+    }
+    out
+}
+
+/// Date PDF « D:20261001113956+01'00' » → « 2026-10-01 11:39:56 +01:00 ».
+fn pdf_date(s: &str) -> String {
+    let d = s.trim_start_matches("D:");
+    let digits: String = d.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 8 {
+        return s.to_string();
+    }
+    let part = |a: usize, b: usize| digits.get(a..b).unwrap_or("00").to_string();
+    let tz = d[digits.len()..].replace('\'', "");
+    let tz = if tz.len() >= 5 { format!(" {}:{}", &tz[..3], &tz[3..5]) } else if tz == "Z" { " UTC".into() } else { String::new() };
+    format!("{}-{}-{} {}:{}:{}{}", part(0, 4), part(4, 6), part(6, 8), part(8, 10), part(10, 12), part(12, 14), tz)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn date_pdf() {
+        assert_eq!(pdf_date("D:20261001113956+01'00'"), "2026-10-01 11:39:56 +01:00");
+        assert_eq!(pdf_date("inconnue"), "inconnue");
+    }
+
+    #[test]
+    fn rotation_image() {
+        let mut p = greedpdf_core::PixelBuf::default();
+        p.reset(2, 1);
+        p.data.copy_from_slice(&[1, 1, 1, 1, 2, 2, 2, 2]);
+        let r = rotate_pixels(&p, 90);
+        assert_eq!((r.w, r.h), (1, 2));
+        assert_eq!(&r.data, &[1, 1, 1, 1, 2, 2, 2, 2]);
+        let r = rotate_pixels(&p, 270);
+        assert_eq!(&r.data, &[2, 2, 2, 2, 1, 1, 1, 1]);
+    }
+}
+

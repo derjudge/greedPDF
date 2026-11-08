@@ -20,7 +20,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use backend_hayro::HayroBackend;
 use backend_mupdf::MupdfBackend;
-use greedpdf_core::{Backend, DocSource, Link, PixelBuf, RenderRequest, SizePt, downscale, page_px};
+use greedpdf_core::{
+    Backend, DocSource, Link, PageText, PixelBuf, RenderRequest, SizePt, downscale, page_px,
+};
 
 use crate::layout::{self, View};
 use crate::mem;
@@ -151,6 +153,12 @@ struct Shared {
     cache: Mutex<Cache>,
     thumbs: Mutex<Vec<Option<Arc<PixelBuf>>>>,
     links: Mutex<Option<Vec<Vec<Link>>>>,
+    /// Texte de chaque page (sélection, copie), extrait en arrière-plan.
+    texts: Mutex<Vec<Option<Arc<PageText>>>>,
+    /// Rotation d'affichage (copie de `View::rotation`, lue sans verrou).
+    rotation: std::sync::atomic::AtomicU32,
+    /// Métadonnées du document (propriétés).
+    metadata: Mutex<Vec<(String, String)>>,
     render_ns: AtomicU64,
     thumb_ns: AtomicU64,
 }
@@ -176,8 +184,10 @@ fn spiral(cur: usize, n: usize) -> impl Iterator<Item = usize> {
 }
 
 impl Shared {
+    /// Échelle « ajustée » (la rotation d'affichage est lue dans la vue).
     fn fit(&self, page: usize, viewport: (u32, u32)) -> f32 {
-        layout::fit_scale(self.sizes[page], viewport)
+        let rot = self.rotation.load(Ordering::Relaxed);
+        layout::fit_scale(layout::rotated(self.sizes[page], rot), viewport)
     }
 
     fn bytes_at(&self, page: usize, scale: f32) -> usize {
@@ -286,7 +296,7 @@ impl Shared {
         if tiles {
             let (level, ts) = self.tile_params(cur, &v);
             let display = fit_cur * v.zoom;
-            for (tx, ty) in layout::visible_tiles(self.sizes[cur], v.viewport, v.origin, display, ts, 1) {
+            for (tx, ty) in layout::visible_tiles(self.sizes[cur], v.viewport, v.origin, display, ts, v.rotation, 1) {
                 let key = ImgKey::Tile { page: cur, level, tx, ty };
                 if c.map.get(&key).is_none_or(|r| (r.scale - ts).abs() > 1e-3) {
                     let clip = layout::tile_rect(self.sizes[cur], ts, tx, ty);
@@ -314,9 +324,9 @@ impl Shared {
                 }
                 let (level, ts) = self.tile_params(p, &v);
                 let display = self.fit(p, v.viewport) * v.zoom;
-                let (pw, ph) = page_px(self.sizes[p], display);
+                let (pw, ph) = page_px(layout::rotated(self.sizes[p], v.rotation), display);
                 let origin = layout::place(pw as f32, ph as f32, v.viewport, (v.origin.0, 0.0));
-                for (tx, ty) in layout::visible_tiles(self.sizes[p], v.viewport, origin, display, ts, 0) {
+                for (tx, ty) in layout::visible_tiles(self.sizes[p], v.viewport, origin, display, ts, v.rotation, 0) {
                     let key = ImgKey::Tile { page: p, level, tx, ty };
                     if !c.map.contains_key(&key) {
                         let clip = layout::tile_rect(self.sizes[p], ts, tx, ty);
@@ -463,6 +473,9 @@ impl Engine {
             cache: Mutex::new(Cache::default()),
             thumbs: Mutex::new(vec![None; n]),
             links: Mutex::new(None),
+            texts: Mutex::new(vec![None; n]),
+            rotation: std::sync::atomic::AtomicU32::new(view.rotation),
+            metadata: Mutex::new(Vec::new()),
             render_ns: AtomicU64::new(0),
             thumb_ns: AtomicU64::new(0),
         });
@@ -481,15 +494,44 @@ impl Engine {
         }
         workers.push(std::thread::Builder::new().name("governor".into()).spawn(move || gov.run())?);
         {
-            // Liens : une instance MuPDF, une fois, en arrière-plan.
+            // Liens, métadonnées puis texte de toutes les pages : une instance
+            // MuPDF, une fois, en arrière-plan (WFRP5 : 87 ms + 1,5 s).
             let shared = shared.clone();
-            std::thread::Builder::new().name("links".into()).spawn(move || {
-                match MupdfBackend::open(&src) {
-                    Ok(mut m) => {
-                        let l = (0..n).map(|p| m.links(p).unwrap_or_default()).collect();
-                        *shared.links.lock().unwrap() = Some(l);
+            let start = view.current;
+            std::thread::Builder::new().name("text".into()).spawn(move || {
+                lower_priority();
+                let mut m = match MupdfBackend::open(&src) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("extraction des liens et du texte impossible : {e:#}");
+                        return;
                     }
-                    Err(e) => eprintln!("extraction des liens impossible : {e:#}"),
+                };
+                let l = (0..n).map(|p| m.links(p).unwrap_or_default()).collect();
+                *shared.links.lock().unwrap() = Some(l);
+                let keys = [
+                    ("Format", "format"),
+                    ("Chiffrement", "encryption"),
+                    ("Titre", "info:Title"),
+                    ("Auteur", "info:Author"),
+                    ("Sujet", "info:Subject"),
+                    ("Mots-clés", "info:Keywords"),
+                    ("Créateur", "info:Creator"),
+                    ("Producteur", "info:Producer"),
+                    ("Créé le", "info:CreationDate"),
+                    ("Modifié le", "info:ModDate"),
+                ];
+                let meta = keys
+                    .iter()
+                    .filter_map(|(label, k)| m.metadata(k).map(|v| (label.to_string(), v)))
+                    .collect();
+                *shared.metadata.lock().unwrap() = meta;
+                for p in spiral(start, n) {
+                    if shared.sched.lock().unwrap().shutdown {
+                        return;
+                    }
+                    let t = m.text(p).unwrap_or_default();
+                    shared.texts.lock().unwrap()[p] = Some(Arc::new(t));
                 }
             })?;
         }
@@ -506,7 +548,8 @@ impl Engine {
         if s.view == view {
             return;
         }
-        if s.view.viewport != view.viewport {
+        if s.view.viewport != view.viewport || s.view.rotation != view.rotation {
+            self.shared.rotation.store(view.rotation, Ordering::Relaxed);
             // Les tuiles dépendent de l'échelle « ajustée » : périmées.
             let mut c = self.shared.cache.lock().unwrap();
             let tiles: Vec<ImgKey> = c.map.keys().filter(|k| matches!(k, ImgKey::Tile { .. })).copied().collect();
@@ -528,6 +571,18 @@ impl Engine {
 
     pub fn s_target(&self) -> f32 {
         self.shared.sched.lock().unwrap().s_target
+    }
+
+    pub fn text(&self, page: usize) -> Option<Arc<PageText>> {
+        self.shared.texts.lock().unwrap().get(page).cloned().flatten()
+    }
+
+    pub fn metadata(&self) -> Vec<(String, String)> {
+        self.shared.metadata.lock().unwrap().clone()
+    }
+
+    pub fn link_count(&self) -> Option<usize> {
+        self.shared.links.lock().unwrap().as_ref().map(|l| l.iter().map(Vec::len).sum())
     }
 
     pub fn links(&self, page: usize) -> Option<Vec<Link>> {

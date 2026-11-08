@@ -13,6 +13,7 @@ struct Quad {
     rect: vec4<f32>,   // destination, coordonnées normalisées : x0, y0, x1, y1
     uv: vec4<f32>,     // zone de la texture : u0, v0, u1, v1
     tint: vec4<f32>,   // multiplicateur de couleur (prémultiplié)
+    params: vec4<f32>, // x : rotation en quarts de tour (sens horaire)
 };
 @group(0) @binding(0) var<uniform> quad: Quad;
 @group(0) @binding(1) var tex: texture_2d<f32>;
@@ -29,7 +30,13 @@ fn vs(@builtin(vertex_index) i: u32) -> VsOut {
     let v = f32(i >> 1u);
     var out: VsOut;
     out.pos = vec4<f32>(mix(quad.rect.x, quad.rect.z, u), mix(quad.rect.y, quad.rect.w, v), 0.0, 1.0);
-    out.uv = vec2<f32>(mix(quad.uv.x, quad.uv.z, u), mix(quad.uv.y, quad.uv.w, v));
+    // Rotation : le coin (u, v) affiché lit la texture en (tu, tv).
+    var t = vec2<f32>(u, v);
+    let r = u32(quad.params.x + 0.5) % 4u;
+    if (r == 1u) { t = vec2<f32>(v, 1.0 - u); }
+    if (r == 2u) { t = vec2<f32>(1.0 - u, 1.0 - v); }
+    if (r == 3u) { t = vec2<f32>(1.0 - v, u); }
+    out.uv = vec2<f32>(mix(quad.uv.x, quad.uv.z, t.x), mix(quad.uv.y, quad.uv.w, t.y));
     return out;
 }
 
@@ -64,7 +71,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-const QUAD_UNIFORM: u64 = 48;
+const QUAD_UNIFORM: u64 = 64;
 const MAX_QUADS: u64 = 4096;
 const TEX_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
@@ -99,6 +106,8 @@ pub struct Draw<'a> {
     pub dest: Rect,
     /// Couleur multipliée (RGBA prémultiplié, 0..1). Blanc = texture telle quelle.
     pub tint: [f32; 4],
+    /// Rotation de l'image en degrés (0, 90, 180, 270), sens horaire.
+    pub rot: u32,
 }
 
 pub struct Gpu {
@@ -149,7 +158,15 @@ impl Gpu {
         if let Some(f) = caps.formats.iter().find(|f| f.is_srgb()) {
             config.format = *f;
         }
-        config.present_mode = wgpu::PresentMode::AutoVsync;
+        // Mailbox : synchronisé à l'écran mais jamais bloquant (la dernière
+        // image gagne). Avec FIFO, `present` peut bloquer jusqu'à 1 s quand la
+        // fenêtre n'est pas affichée (constaté avec le pilote NVIDIA), ce qui
+        // gèle la boucle d'événements.
+        config.present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            wgpu::PresentMode::Mailbox
+        } else {
+            wgpu::PresentMode::AutoVsync
+        };
         config.desired_maximum_frame_latency = 1;
         surface.configure(&device, &config);
 
@@ -414,7 +431,21 @@ impl Gpu {
 
     /// Dessine une frame : fond, puis les éléments dans l'ordre.
     pub fn draw(&self, items: &[Draw]) {
-        let frame = match self.surface.get_current_texture() {
+        let t0 = std::time::Instant::now();
+        let acquired = self.surface.get_current_texture();
+        if std::env::var_os("GREEDPDF_DEBUG_GPU").is_some() {
+            let kind = match &acquired {
+                wgpu::CurrentSurfaceTexture::Success(_) => "ok",
+                wgpu::CurrentSurfaceTexture::Suboptimal(_) => "sous-optimal",
+                wgpu::CurrentSurfaceTexture::Timeout => "délai dépassé",
+                wgpu::CurrentSurfaceTexture::Occluded => "masquée",
+                wgpu::CurrentSurfaceTexture::Outdated => "périmée",
+                wgpu::CurrentSurfaceTexture::Lost => "perdue",
+                _ => "autre",
+            };
+            eprintln!("[gpu] acquisition {kind} en {:.1} ms ({} éléments)", t0.elapsed().as_secs_f64() * 1e3, items.len());
+        }
+        let frame = match acquired {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
@@ -428,7 +459,7 @@ impl Gpu {
         let mut data = vec![0u8; (self.uniform_stride * items.len().max(1) as u64) as usize];
         for (i, it) in items.iter().enumerate() {
             let d = it.dest;
-            let v: [f32; 12] = [
+            let v: [f32; 16] = [
                 d.x / ww * 2.0 - 1.0,
                 1.0 - d.y / wh * 2.0,
                 (d.x + d.w) / ww * 2.0 - 1.0,
@@ -441,6 +472,10 @@ impl Gpu {
                 it.tint[1],
                 it.tint[2],
                 it.tint[3],
+                (it.rot / 90 % 4) as f32,
+                0.0,
+                0.0,
+                0.0,
             ];
             let off = i * self.uniform_stride as usize;
             for (j, f) in v.iter().enumerate() {
@@ -473,6 +508,10 @@ impl Gpu {
         }
         self.queue.submit([enc.finish()]);
         self.window.pre_present_notify();
+        let t = std::time::Instant::now();
         self.queue.present(frame);
+        if std::env::var_os("GREEDPDF_DEBUG_GPU").is_some() {
+            eprintln!("[gpu] présentation en {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+        }
     }
 }

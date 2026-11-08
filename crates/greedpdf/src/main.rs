@@ -153,7 +153,7 @@ fn bench(args: &Args, src: DocSource) -> Result<()> {
         args.max_ram
     );
     let t0 = Instant::now();
-    let engine = Engine::new(src, cfg, View { current: start, viewport: (w, h), zoom: 1.0, origin: (0.0, 0.0) }, notify.clone())?;
+    let engine = Engine::new(src, cfg, View { current: start, viewport: (w, h), zoom: 1.0, origin: (0.0, 0.0), rotation: 0 }, notify.clone())?;
     let opened = t0.elapsed();
     println!("document ouvert en {:.0} ms : {} pages", opened.as_secs_f64() * 1e3, engine.page_count);
     println!(

@@ -93,6 +93,18 @@ Tous les raccourcis sont centralisés dans une table (reconfigurable en v2).
 
 ---
 
+### 2.4 Fonctionnalités ajoutées après le MVP (`fonctionnalités.md`)
+
+| Demande | Réalisation |
+|---|---|
+| Bouton « Options » : impression, plein écran, pivoter (`R` horaire, `E` anti-horaire), propriétés copiables | Bouton en haut à droite, menu déroulant. Impression : envoi du fichier à l'imprimante par défaut (`lp`, CUPS), sans boîte de dialogue. Rotation par quarts de tour faite par le GPU (aucun re-rendu des images en cache ; les tuiles et les liens suivent). Propriétés : fichier, dossier, taille, pages, métadonnées PDF (MuPDF), format de page, liens, texte, état du préchargement ; bouton « Copier ». |
+| Menu clic droit : copier l'image, tout sélectionner | Clic droit sans déplacement. « Copier l'image de la page » copie l'image L0 (orientée comme à l'écran) ; « Copier le texte » apparaît s'il y a une sélection. |
+| Molette : monter, descendre | Inchangé : défilement de la page zoomée ; page ±1 quand la page entière est visible. |
+| `Maj+molette` : zoom | Zoom autour du curseur (`Ctrl+molette` aussi). Le défilement horizontal passe par le glisser au clic droit. |
+| Glisser au clic droit : déplacer la vue | Oui (auparavant au clic gauche). |
+| Clic gauche : sélection du texte | Glisser au clic gauche ; texte de toutes les pages extrait en arrière-plan par MuPDF (WFRP5 : 1,2 million de caractères en 1,5 s) ; sélection dans l'ordre de lecture, surlignée en bleu ; `Ctrl+C`, `Ctrl+A`, `Échap`. Un simple clic suit toujours les liens. |
+| Volet masqué par défaut | Oui (`F9`). |
+
 ## 3. Choix du moteur PDF
 
 ### 3.1 Candidats

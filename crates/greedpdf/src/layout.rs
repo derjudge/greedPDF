@@ -17,6 +17,40 @@ pub struct View {
     pub zoom: f32,
     /// Position du coin haut-gauche de la page courante dans la zone d'affichage.
     pub origin: (f32, f32),
+    /// Rotation d'affichage en degrés (0, 90, 180, 270), sens horaire.
+    pub rotation: u32,
+}
+
+/// Taille de la page telle qu'affichée après rotation.
+pub fn rotated(size: SizePt, rot: u32) -> SizePt {
+    if rot % 180 == 90 { SizePt { w: size.h, h: size.w } } else { size }
+}
+
+/// Point (x, y) de la page non tournée (dimensions pw × ph) → point affiché.
+pub fn rot_point(x: f32, y: f32, pw: f32, ph: f32, rot: u32) -> (f32, f32) {
+    match rot % 360 {
+        90 => (ph - y, x),
+        180 => (pw - x, ph - y),
+        270 => (y, pw - x),
+        _ => (x, y),
+    }
+}
+
+/// Point affiché → point de la page non tournée (inverse de `rot_point`).
+pub fn unrot_point(x: f32, y: f32, pw: f32, ph: f32, rot: u32) -> (f32, f32) {
+    match rot % 360 {
+        90 => (y, ph - x),
+        180 => (pw - x, ph - y),
+        270 => (pw - y, x),
+        _ => (x, y),
+    }
+}
+
+/// Rectangle (x0, y0, x1, y1) de la page non tournée → rectangle affiché.
+pub fn rot_rect(r: (f32, f32, f32, f32), pw: f32, ph: f32, rot: u32) -> (f32, f32, f32, f32) {
+    let (ax, ay) = rot_point(r.0, r.1, pw, ph, rot);
+    let (bx, by) = rot_point(r.2, r.3, pw, ph, rot);
+    (ax.min(bx), ay.min(by), ax.max(bx), ay.max(by))
 }
 
 /// Échelle (pixels par point) qui fait tenir la page entière dans la zone.
@@ -44,27 +78,37 @@ pub fn tile_scale(fit: f32, level: i32) -> f32 {
 }
 
 /// Tuiles (tx, ty) d'une page visibles dans la zone d'affichage, avec une
-/// couronne de `margin` tuiles. `origin` : coin de la page à l'écran,
-/// `display` : échelle d'affichage, `ts` : échelle de rendu des tuiles.
+/// couronne de `margin` tuiles. `origin` : coin de la page (affichée, donc
+/// tournée) à l'écran, `display` : échelle d'affichage, `ts` : échelle de
+/// rendu des tuiles (dans l'espace de la page non tournée).
+#[allow(clippy::too_many_arguments)]
 pub fn visible_tiles(
     size: SizePt,
     viewport: (u32, u32),
     origin: (f32, f32),
     display: f32,
     ts: f32,
+    rot: u32,
     margin: i32,
 ) -> Vec<(u32, u32)> {
     let (pw, ph) = greedpdf_core::page_px(size, ts);
     let (nx, ny) = (pw.div_ceil(TILE) as i32, ph.div_ceil(TILE) as i32);
-    // Zone visible en points de page, puis en pixels de tuile.
+    // Zone visible dans la page affichée, en pixels de tuile…
     let k = ts / display;
-    let x0 = ((-origin.0) * k).max(0.0);
-    let y0 = ((-origin.1) * k).max(0.0);
-    let x1 = ((viewport.0 as f32 - origin.0) * k).min(pw as f32);
-    let y1 = ((viewport.1 as f32 - origin.1) * k).min(ph as f32);
-    if x1 <= x0 || y1 <= y0 {
+    let r = rotated(SizePt { w: pw as f32, h: ph as f32 }, rot);
+    let vis = (
+        ((-origin.0) * k).max(0.0),
+        ((-origin.1) * k).max(0.0),
+        ((viewport.0 as f32 - origin.0) * k).min(r.w),
+        ((viewport.1 as f32 - origin.1) * k).min(r.h),
+    );
+    if vis.2 <= vis.0 || vis.3 <= vis.1 {
         return Vec::new();
     }
+    // … ramenée dans la page non tournée.
+    let (ax, ay) = unrot_point(vis.0, vis.1, pw as f32, ph as f32, rot);
+    let (bx, by) = unrot_point(vis.2, vis.3, pw as f32, ph as f32, rot);
+    let (x0, y0, x1, y1) = (ax.min(bx), ay.min(by), ax.max(bx), ay.max(by));
     let tx0 = ((x0 / TILE as f32) as i32 - margin).max(0);
     let ty0 = ((y0 / TILE as f32) as i32 - margin).max(0);
     let tx1 = ((x1 / TILE as f32).ceil() as i32 + margin).min(nx);
@@ -92,6 +136,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rotations_inverses() {
+        for rot in [0, 90, 180, 270] {
+            let (x, y) = rot_point(10.0, 20.0, 100.0, 200.0, rot);
+            assert_eq!(unrot_point(x, y, 100.0, 200.0, rot), (10.0, 20.0), "rot {rot}");
+        }
+        assert_eq!(rot_point(0.0, 0.0, 100.0, 200.0, 90), (200.0, 0.0));
+    }
+
+    #[test]
     fn paliers() {
         assert_eq!(tile_level(1.0), 0);
         assert_eq!(tile_level(1.25), 1);
@@ -110,10 +163,15 @@ mod tests {
     fn tuiles_visibles() {
         let size = SizePt { w: 1000.0, h: 1000.0 };
         // Page de 3000 px affichée à l'échelle 3, coin à (0, 0), écran 1024².
-        let t = visible_tiles(size, (1024, 1024), (0.0, 0.0), 3.0, 3.0, 0);
+        let t = visible_tiles(size, (1024, 1024), (0.0, 0.0), 3.0, 3.0, 0, 0);
         assert_eq!(t, vec![(0, 0)]);
-        let t = visible_tiles(size, (1024, 1024), (-1024.0, 0.0), 3.0, 3.0, 0);
+        let t = visible_tiles(size, (1024, 1024), (-1024.0, 0.0), 3.0, 3.0, 0, 0);
         assert_eq!(t, vec![(1, 0)]);
+        // Rotation de 90° : le coin haut-gauche affiché correspond au bas de la
+        // colonne x = 0 de la page non tournée, y ∈ [1976, 3000] → rangées 2 et 1
+        // (la plus proche du centre d'abord).
+        let t = visible_tiles(size, (1024, 1024), (0.0, 0.0), 3.0, 3.0, 90, 0);
+        assert_eq!(t, vec![(0, 2), (0, 1)]);
         let r = tile_rect(size, 3.0, 2, 2);
         assert_eq!((r.x, r.w, r.h), (2048, 3000 - 2048, 3000 - 2048));
     }

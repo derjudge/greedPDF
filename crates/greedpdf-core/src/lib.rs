@@ -181,3 +181,57 @@ mod tests {
         assert_eq!(d.data[3], 255);
     }
 }
+
+/// Caractère d'une page, avec son rectangle en points (origine en haut à gauche).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextChar {
+    pub c: char,
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+    /// Dernier caractère de sa ligne.
+    pub eol: bool,
+    /// Dernier caractère de son bloc (paragraphe).
+    pub eob: bool,
+}
+
+/// Texte d'une page dans l'ordre de lecture.
+#[derive(Debug, Clone, Default)]
+pub struct PageText {
+    pub chars: Vec<TextChar>,
+}
+
+impl PageText {
+    /// Texte des caractères `a..=b`, avec retours à la ligne.
+    pub fn extract(&self, a: usize, b: usize) -> String {
+        let mut s = String::new();
+        for ch in self.chars.iter().take(b.min(self.chars.len().saturating_sub(1)) + 1).skip(a) {
+            s.push(ch.c);
+            if ch.eob {
+                s.push_str("\n\n");
+            } else if ch.eol {
+                s.push('\n');
+            }
+        }
+        s.trim_end().to_string()
+    }
+
+    /// Index du caractère sous le point (x, y), ou du plus proche si `nearest`.
+    pub fn hit(&self, x: f32, y: f32, nearest: bool) -> Option<usize> {
+        let mut best: Option<(f32, usize)> = None;
+        for (i, ch) in self.chars.iter().enumerate() {
+            let dx = (ch.x0 - x).max(0.0).max(x - ch.x1);
+            let dy = (ch.y0 - y).max(0.0).max(y - ch.y1);
+            if dx == 0.0 && dy == 0.0 {
+                return Some(i);
+            }
+            // L'écart vertical compte davantage : on reste sur la bonne ligne.
+            let d = dx + 4.0 * dy;
+            if best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, i));
+            }
+        }
+        if nearest { best.map(|(_, i)| i) } else { None }
+    }
+}

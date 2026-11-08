@@ -29,7 +29,8 @@ use anyhow::{Context as _, anyhow};
 use parking_lot::lock_api::RawMutex as _;
 use parking_lot::RawMutex;
 use greedpdf_core::{
-    Backend, DocSource, Link, LinkTarget, PixelBuf, RenderRequest, Result, SizePt, page_px,
+    Backend, DocSource, Link, LinkTarget, PageText, PixelBuf, RenderRequest, Result, SizePt,
+    TextChar, page_px,
 };
 use mupdf_sys as sys;
 
@@ -300,5 +301,81 @@ impl Backend for MupdfBackend {
             unsafe { sys::fz_drop_link(ctx, head) };
         }
         Ok(v)
+    }
+}
+
+impl MupdfBackend {
+    /// Texte de la page, caractère par caractère, dans l'ordre de lecture.
+    pub fn text(&mut self, page: usize) -> Result<PageText> {
+        let b = self.bounds(page)?;
+        let p = self.load_page(page)?;
+        let ctx = self.ctx;
+        let opts = sys::fz_stext_options {
+            flags: 0,
+            scale: 1.0,
+            clip: sys::fz_rect { x0: 0.0, y0: 0.0, x1: 0.0, y1: 0.0 },
+        };
+        let st = ffi!(mupdf_new_stext_page_from_page(ctx, p.page, &opts))?;
+        if st.is_null() {
+            return Err(anyhow!("extraction du texte impossible page {}", page + 1));
+        }
+        let mut out = PageText::default();
+        // SAFETY : parcours en lecture des listes chaînées de la page de texte,
+        // valides jusqu'à fz_drop_stext_page.
+        unsafe {
+            let mut block = (*st).first_block;
+            while !block.is_null() {
+                if (*block).type_ == sys::FZ_STEXT_BLOCK_TEXT as i32 {
+                    let mut line = (*block).u.t.first_line;
+                    while !line.is_null() {
+                        let mut ch = (*line).first_char;
+                        while !ch.is_null() {
+                            let q = (*ch).quad;
+                            let xs = [q.ul.x, q.ur.x, q.ll.x, q.lr.x];
+                            let ys = [q.ul.y, q.ur.y, q.ll.y, q.lr.y];
+                            let c = char::from_u32((*ch).c as u32).unwrap_or('\u{fffd}');
+                            out.chars.push(TextChar {
+                                c,
+                                x0: xs.iter().copied().fold(f32::MAX, f32::min) - b.x0,
+                                y0: ys.iter().copied().fold(f32::MAX, f32::min) - b.y0,
+                                x1: xs.iter().copied().fold(f32::MIN, f32::max) - b.x0,
+                                y1: ys.iter().copied().fold(f32::MIN, f32::max) - b.y0,
+                                eol: false,
+                                eob: false,
+                            });
+                            ch = (*ch).next;
+                        }
+                        if let Some(last) = out.chars.last_mut() {
+                            last.eol = true;
+                        }
+                        line = (*line).next;
+                    }
+                    if let Some(last) = out.chars.last_mut() {
+                        last.eob = true;
+                    }
+                }
+                block = (*block).next;
+            }
+            sys::fz_drop_stext_page(ctx, st);
+        }
+        Ok(out)
+    }
+
+    /// Métadonnée du document (« format », « encryption », « info:Title »…).
+    pub fn metadata(&mut self, key: &str) -> Option<String> {
+        let k = CString::new(key).ok()?;
+        let v = ffi!(mupdf_lookup_metadata(self.ctx, self.doc, k.as_ptr())).ok()?;
+        if v.is_null() {
+            return None;
+        }
+        unsafe extern "C" {
+            fn free(p: *mut std::ffi::c_void);
+        }
+        // SAFETY : chaîne C allouée par `calloc` dans le wrapper de mupdf-sys
+        // (wrapper/document.c), donc libérée par `free`.
+        let s = unsafe { CStr::from_ptr(v).to_string_lossy().into_owned() };
+        unsafe { free(v as *mut std::ffi::c_void) };
+        let s = s.trim().to_string();
+        (!s.is_empty()).then_some(s)
     }
 }
