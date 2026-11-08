@@ -129,6 +129,13 @@ pub enum Action {
     Clip,
     /// Clic sur « Copier » dans la fenêtre des propriétés.
     PropsCopy,
+    /// Ctrl+F puis saisie du mot (par les vrais gestionnaires ; la recherche
+    /// se fait pendant la frappe).
+    Search(String),
+    /// Clic sur le i-ième résultat de la liste (volet).
+    Result(usize),
+    /// Clic sur un bouton de la barre de recherche : prev, next, case, words.
+    SearchButton(String),
     /// Clic sur le champ de page / sur le bouton du volet (barre d'outils).
     PageField,
     SidebarButton,
@@ -175,6 +182,9 @@ pub fn parse_script(s: &str) -> anyhow::Result<Vec<Action>> {
                 "clip" => Action::Clip,
                 "propscopy" => Action::PropsCopy,
                 "pagefield" => Action::PageField,
+                "search" => Action::Search(parts.get(1).unwrap_or(&"").to_string()),
+                "result" => Action::Result(num(1)? as usize),
+                "searchbtn" => Action::SearchButton(parts.get(1).unwrap_or(&"next").to_string()),
                 "sidebarbtn" => Action::SidebarButton,
                 "shot" => Action::Shot(parts.get(1).unwrap_or(&"capture").to_string()),
                 "wait" => Action::Wait(num(1)? as u64),
@@ -228,6 +238,27 @@ pub struct App {
     /// Champ de page tout juste ouvert : le contenu est sélectionné, le
     /// premier chiffre tapé le remplace.
     goto_fresh: bool,
+    /// Recherche (Ctrl+F) : texte du champ, champ actif, contenu sélectionné.
+    search_text: String,
+    search_focus: bool,
+    search_fresh: bool,
+    /// Résultats (page, premier, dernier caractère) pour `search_query`.
+    search_results: Vec<(usize, usize, usize)>,
+    search_query: String,
+    search_cur: Option<usize>,
+    /// Le texte n'était pas encore extrait partout lors de la recherche.
+    search_partial: bool,
+    loupe: Option<Tex>,
+    /// Barre de recherche ouverte (comme evince : sous la barre d'outils).
+    search_open: bool,
+    search_case: bool,
+    search_words: bool,
+    /// Volet visible avant l'ouverture de la recherche (rétabli à la fermeture).
+    sidebar_before_search: bool,
+    results_scroll: f32,
+    /// Textures des résultats visibles : page, avant, occurrence, après.
+    result_tex: HashMap<usize, [Tex; 4]>,
+    chevrons: Option<(Tex, Tex)>,
     modifiers: ModifiersState,
     cursor: (f32, f32),
     press: Option<((f32, f32), (f32, f32))>,
@@ -286,6 +317,21 @@ impl App {
             status: true,
             goto: None,
             goto_fresh: false,
+            search_text: String::new(),
+            search_focus: false,
+            search_fresh: false,
+            search_results: Vec::new(),
+            search_query: String::new(),
+            search_cur: None,
+            search_partial: false,
+            loupe: None,
+            search_open: false,
+            search_case: false,
+            search_words: false,
+            sidebar_before_search: false,
+            results_scroll: 0.0,
+            result_tex: HashMap::new(),
+            chevrons: None,
             modifiers: ModifiersState::empty(),
             cursor: (0.0, 0.0),
             press: None,
@@ -329,7 +375,13 @@ impl App {
     }
 
     fn sidebar_width(&self) -> f32 {
-        if self.sidebar { self.opts.config.thumb_width as f32 + 2.0 * SIDEBAR_PAD } else { 0.0 }
+        if !self.sidebar {
+            0.0
+        } else if self.search_open {
+            self.results_width()
+        } else {
+            self.opts.config.thumb_width as f32 + 2.0 * SIDEBAR_PAD
+        }
     }
 
     /// Hauteur de la barre d'outils (en haut de la fenêtre).
@@ -337,11 +389,16 @@ impl App {
         (self.text_px() * 2.3).round()
     }
 
+    /// Hauteur totale des barres : outils, plus recherche si elle est ouverte.
+    fn top_h(&self) -> f32 {
+        if self.search_open { 2.0 * self.bar_h() } else { self.bar_h() }
+    }
+
     /// Zone d'affichage des pages (sous la barre, à droite du volet).
     fn area(&self) -> Rect {
         let (w, h) = self.gpu.as_ref().map_or((1, 1), |g| g.size());
         let x = self.sidebar_width();
-        let y = self.bar_h();
+        let y = self.top_h();
         Rect::new(x, y, (w as f32 - x).max(1.0), (h as f32 - y).max(1.0))
     }
 
@@ -368,6 +425,57 @@ impl App {
     /// Texte « / N » affiché après le champ de page.
     fn page_total_label(&self) -> String {
         format!("/ {}", self.engine.as_ref().map_or(0, |e| e.page_count))
+    }
+
+    /// Bouton loupe de la barre d'outils (ouvre / ferme la recherche).
+    fn search_toggle(&self) -> Rect {
+        let o = self.options_button();
+        Rect::new(o.x - o.h - 8.0, o.y, o.h, o.h)
+    }
+
+    /// Champ de la barre de recherche (centré sous la barre d'outils).
+    fn search_field(&self) -> Rect {
+        let px = self.text_px();
+        let h = self.bar_item_h();
+        let ww = self.gpu.as_ref().map_or(1, |g| g.size().0) as f32;
+        let w = (px * 24.0).round();
+        let y = self.bar_h() + ((self.bar_h() - h) / 2.0).round();
+        Rect::new(((ww - w) / 2.0 - h).round().max(8.0), y, w, h)
+    }
+
+    /// Boutons de la barre de recherche : précédent, suivant, casse, mots entiers.
+    fn search_buttons(&self) -> [Rect; 4] {
+        let px = self.text_px();
+        let f = self.search_field();
+        let prev = Rect::new(f.x + f.w + 4.0, f.y, f.h, f.h);
+        let next = Rect::new(prev.x + prev.w + 2.0, f.y, f.h, f.h);
+        let cw = (self.text_width("Aa", px) + px * 1.2).round();
+        let case = Rect::new(next.x + next.w + px, f.y, cw, f.h);
+        let ww = (self.text_width("Mots entiers", px) + px * 1.2).round();
+        let words = Rect::new(case.x + case.w + 4.0, f.y, ww, f.h);
+        [prev, next, case, words]
+    }
+
+    /// Compteur de résultats (barre de recherche).
+    fn search_label(&self) -> Option<String> {
+        if self.search_query.is_empty() {
+            return None;
+        }
+        let partial = if self.search_partial { " (texte en cours d'extraction)" } else { "" };
+        Some(match (self.search_results.len(), self.search_cur) {
+            (0, _) => format!("aucun résultat{partial}"),
+            (n, Some(i)) => format!("{} sur {n}{partial}", i + 1),
+            (n, None) => format!("{n} résultats{partial}"),
+        })
+    }
+
+    /// Largeur du volet quand il montre les résultats de recherche.
+    fn results_width(&self) -> f32 {
+        (self.text_px() * 22.0).round()
+    }
+
+    fn result_item_h(&self) -> f32 {
+        (self.text_px() * 3.4).round()
     }
 
     fn viewport(&self) -> (u32, u32) {
@@ -570,7 +678,12 @@ impl App {
     }
 
     fn click(&mut self, x: f32, y: f32) {
-        if x < self.sidebar_width() {
+        if x < self.sidebar_width() && self.search_open {
+            if let Some(i) = self.result_at(y) {
+                self.search_cur = Some(i);
+                self.show_result(i);
+            }
+        } else if x < self.sidebar_width() {
             if let Some(p) = self.thumb_at(y) {
                 self.jump(p, None, "miniature");
             }
@@ -766,6 +879,300 @@ impl App {
         self.request_redraw();
     }
 
+    // ------------------------------------------------------- recherche
+
+    /// Ouvre la barre de recherche (Ctrl+F, loupe) : le volet passe aux résultats.
+    fn open_search(&mut self) {
+        self.goto = None;
+        if !self.search_open {
+            self.search_open = true;
+            self.sidebar_before_search = self.sidebar;
+            self.sidebar = true;
+        }
+        self.search_focus = true;
+        self.search_fresh = !self.search_text.is_empty();
+        self.update_view();
+    }
+
+    /// Ferme la recherche (Échap) : efface les résultats, rétablit le volet.
+    fn close_search(&mut self) {
+        if !self.search_open {
+            return;
+        }
+        self.search_open = false;
+        self.search_focus = false;
+        self.search_query.clear();
+        self.search_results.clear();
+        self.search_cur = None;
+        self.result_tex.clear();
+        self.sidebar = self.sidebar_before_search;
+        self.reveal_thumb(self.current);
+        self.update_view();
+    }
+
+    /// Recherche pendant la frappe : recalcule les résultats et va au premier
+    /// à partir de la page courante (comme evince).
+    fn search_update(&mut self) {
+        let q = self.search_text.trim().to_string();
+        self.result_tex.clear();
+        self.results_scroll = 0.0;
+        if q.is_empty() {
+            self.search_query.clear();
+            self.search_results.clear();
+            self.search_cur = None;
+            self.request_redraw();
+            return;
+        }
+        let (case, words) = (self.search_case, self.search_words);
+        let folded = greedpdf_core::fold_query_opt(&q, case);
+        let e = self.engine();
+        let (done, total) = e.text_progress();
+        let mut results = Vec::new();
+        for p in 0..e.page_count {
+            if let Some(t) = e.text(p) {
+                results.extend(t.find_opt(&folded, case, words).into_iter().map(|(a, b)| (p, a, b)));
+            }
+        }
+        self.search_partial = done < total;
+        self.search_results = results;
+        self.search_query = q;
+        let cur = self.current;
+        self.search_cur = (!self.search_results.is_empty())
+            .then(|| self.search_results.iter().position(|r| r.0 >= cur).unwrap_or(0));
+        if let Some(i) = self.search_cur {
+            self.show_result(i);
+        }
+        self.request_redraw();
+    }
+
+    /// Résultat suivant (`forward`) ou précédent (Entrée, Ctrl+G, F3, flèches).
+    fn search_step(&mut self, forward: bool) {
+        if self.search_text.trim() != self.search_query {
+            self.search_update();
+            return;
+        }
+        let n = self.search_results.len();
+        if n == 0 {
+            return;
+        }
+        let i = match self.search_cur {
+            None => 0,
+            Some(i) if forward => (i + 1) % n,
+            Some(i) => (i + n - 1) % n,
+        };
+        self.search_cur = Some(i);
+        self.show_result(i);
+    }
+
+    fn result_at(&self, y: f32) -> Option<usize> {
+        let k = (y - self.top_h() + self.results_scroll - SIDEBAR_PAD / 2.0) / self.result_item_h();
+        (k >= 0.0 && (k as usize) < self.search_results.len()).then_some(k as usize)
+    }
+
+    fn clamp_results(&mut self) {
+        let total = self.search_results.len() as f32 * self.result_item_h() + SIDEBAR_PAD;
+        let max = (total - self.area().h).max(0.0);
+        self.results_scroll = self.results_scroll.clamp(0.0, max);
+    }
+
+    /// Fait défiler la liste pour que le résultat `i` soit visible.
+    fn reveal_result(&mut self, i: usize) {
+        let ih = self.result_item_h();
+        let (top, h) = (i as f32 * ih + SIDEBAR_PAD / 2.0, self.area().h);
+        if top < self.results_scroll || top + ih > self.results_scroll + h {
+            self.results_scroll = top - (h - ih) / 2.0;
+        }
+        self.clamp_results();
+    }
+
+    fn visible_results(&self) -> std::ops::Range<usize> {
+        let ih = self.result_item_h();
+        let first = (self.results_scroll / ih).floor().max(0.0) as usize;
+        let last = ((self.results_scroll + self.area().h) / ih).ceil() as usize + 1;
+        first.min(self.search_results.len())..last.min(self.search_results.len())
+    }
+
+    /// Textures (page, avant, occurrence, après) des résultats visibles.
+    fn prepare_result_textures(&mut self) {
+        if !self.search_open || !self.sidebar {
+            return;
+        }
+        let Some(text) = &self.text else { return };
+        let px = self.text_px();
+        let small = (px * 0.85).round();
+        let maxw = self.results_width() - 2.0 * SIDEBAR_PAD;
+        let range = self.visible_results();
+        for i in range.clone() {
+            if self.result_tex.contains_key(&i) {
+                continue;
+            }
+            let (page, a, b) = self.search_results[i];
+            let Some(t) = self.engine.as_ref().and_then(|e| e.text(page)) else { continue };
+            let (mut before, mid, mut after) = t.context(a, b, 60);
+            // Raccourcit l'extrait pour tenir sur une ligne, l'occurrence au milieu.
+            let mw = text.width(&mid, px);
+            while !before.is_empty() && text.width(&before, px) > (maxw - mw) * 0.45 {
+                let mut c = before.chars();
+                c.next();
+                before = c.as_str().to_string();
+            }
+            if !before.is_empty() {
+                before = format!("…{}", before.trim_start());
+            }
+            while !after.is_empty() && text.width(&before, px) + mw + text.width(&after, px) > maxw {
+                after.pop();
+            }
+            let g = self.gpu.as_ref().unwrap();
+            let up = |s: &str, sz: f32| {
+                let img = text.render(if s.is_empty() { " " } else { s }, sz);
+                g.upload(img.w, img.h, &img.data, false)
+            };
+            let tex = [up(&format!("Page {}", page + 1), small), up(&before, px), up(&mid, px), up(&after, px)];
+            self.result_tex.insert(i, tex);
+        }
+        if self.result_tex.len() > 400 {
+            self.result_tex.retain(|i, _| range.contains(i));
+        }
+    }
+
+    fn push_results<'a>(&'a self, items: &mut Vec<Draw<'a>>, top: f32, w: f32, _h: f32) {
+        let g = self.gpu.as_ref().unwrap();
+        let px = self.text_px();
+        let ih = self.result_item_h();
+        let plain = |tex: &'a Tex, dest: Rect, tint: [f32; 4]| Draw { tex, dest, tint, rot: 0 };
+        for i in self.visible_results() {
+            let y = (top + SIDEBAR_PAD / 2.0 + i as f32 * ih - self.results_scroll).round();
+            if self.search_cur == Some(i) {
+                items.push(plain(g.white(), Rect::new(4.0, y, w - 8.0, ih - 4.0), [0.16, 0.36, 0.7, 1.0]));
+            }
+            let Some([pg, before, mid, after]) = self.result_tex.get(&i) else { continue };
+            let x = SIDEBAR_PAD;
+            items.push(plain(pg, Rect::new(x, y + px * 0.25, pg.w as f32, pg.h as f32), [0.6, 0.6, 0.62, 0.75]));
+            let ly = (y + px * 1.5).round();
+            let mut cx = x;
+            for (t, hl) in [(before, false), (mid, true), (after, false)] {
+                if hl {
+                    items.push(plain(g.white(), Rect::new(cx, ly + 2.0, t.w as f32, t.h as f32 - 4.0), [0.5, 0.42, 0.0, 0.6]));
+                }
+                items.push(plain(t, Rect::new(cx.round(), ly, t.w as f32, t.h as f32), WHITE));
+                cx += t.w as f32 - 2.0;
+            }
+        }
+        if self.search_results.is_empty() && !self.search_query.is_empty() {
+            if let Some(t) = self.ui_tex("aucun résultat", px) {
+                items.push(plain(t, Rect::new(SIDEBAR_PAD, top + SIDEBAR_PAD, t.w as f32, t.h as f32), [0.7, 0.7, 0.7, 0.8]));
+            }
+        }
+    }
+
+    /// Chevron (haut ou bas) pour les boutons précédent / suivant.
+    fn make_chevron(size: u32, up: bool) -> greedpdf_core::PixelBuf {
+        let mut img = greedpdf_core::PixelBuf::default();
+        img.reset(size, size);
+        let s = size as f32;
+        let th = 0.09 * s;
+        let (ax, bx, cx) = (0.25 * s, 0.5 * s, 0.75 * s);
+        let (ay, by) = if up { (0.62 * s, 0.38 * s) } else { (0.38 * s, 0.62 * s) };
+        let seg = |px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32| {
+            let (dx, dy) = (x1 - x0, y1 - y0);
+            let t = (((px - x0) * dx + (py - y0) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+            ((px - x0 - t * dx).powi(2) + (py - y0 - t * dy).powi(2)).sqrt()
+        };
+        for y in 0..size {
+            for x in 0..size {
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                let d = seg(px, py, ax, ay, bx, by).min(seg(px, py, bx, by, cx, ay)) - th / 2.0;
+                let v = ((0.5 - d).clamp(0.0, 1.0) * 255.0) as u8;
+                let i = ((y * size + x) * 4) as usize;
+                img.data[i..i + 4].copy_from_slice(&[v, v, v, v]);
+            }
+        }
+        img
+    }
+
+    /// Affiche le résultat `i` : change de page si besoin, et fait défiler
+    /// une page zoomée pour que le mot soit visible.
+    fn show_result(&mut self, i: usize) {
+        self.reveal_result(i);
+        let (page, a, _) = self.search_results[i];
+        let Some(t) = self.engine().text(page) else { return };
+        let Some(ch) = t.chars.get(a).copied() else { return };
+        if page != self.current {
+            self.start_nav(format!("recherche → page {}", page + 1));
+            self.current = page;
+            self.after_page_change();
+        }
+        // Mot à ~30 % de la hauteur si la page dépasse l'écran (rotation comprise).
+        let r = self.page_to_screen(ch.x0, ch.y0, ch.x1, ch.y1);
+        let a_ = self.area();
+        if r.y < a_.y || r.y + r.h > a_.y + a_.h {
+            self.origin.1 += a_.y + a_.h * 0.3 - r.y;
+        }
+        if r.x < a_.x || r.x + r.w > a_.x + a_.w {
+            self.origin.0 += a_.x + a_.w * 0.5 - r.x;
+        }
+        self.update_view();
+    }
+
+    /// Rectangles à l'écran des caractères `a..=b` de la page courante.
+    fn range_rects(&self, t: &PageText, a: usize, b: usize) -> Vec<Rect> {
+        let (a, b) = (a.min(b), a.max(b).min(t.chars.len().saturating_sub(1)));
+        let mut out = Vec::new();
+        let mut run: Option<(f32, f32, f32, f32)> = None;
+        for ch in t.chars.get(a..=b).unwrap_or(&[]) {
+            let r = run.get_or_insert((ch.x0, ch.y0, ch.x1, ch.y1));
+            *r = (r.0.min(ch.x0), r.1.min(ch.y0), r.2.max(ch.x1), r.3.max(ch.y1));
+            if ch.eol {
+                let (x0, y0, x1, y1) = run.take().unwrap();
+                out.push(self.page_to_screen(x0, y0, x1, y1));
+            }
+        }
+        if let Some((x0, y0, x1, y1)) = run {
+            out.push(self.page_to_screen(x0, y0, x1, y1));
+        }
+        out
+    }
+
+    /// Résultats de recherche visibles : (rectangle, est le résultat courant).
+    fn search_rects(&self) -> Vec<(Rect, bool)> {
+        let Some(t) = self.page_text() else { return Vec::new() };
+        let cur = self.current;
+        let start = self.search_results.partition_point(|r| r.0 < cur);
+        self.search_results[start..]
+            .iter()
+            .enumerate()
+            .take_while(|(_, r)| r.0 == cur)
+            .flat_map(|(k, &(_, a, b))| {
+                let is_cur = self.search_cur == Some(start + k);
+                self.range_rects(&t, a, b).into_iter().map(move |r| (r, is_cur))
+            })
+            .collect()
+    }
+
+    /// Icône loupe (cercle et manche), dessinée une fois en RGBA prémultiplié.
+    fn make_loupe(size: u32) -> greedpdf_core::PixelBuf {
+        let mut img = greedpdf_core::PixelBuf::default();
+        img.reset(size, size);
+        let s = size as f32;
+        let (cx, cy, r, th) = (0.42 * s, 0.42 * s, 0.27 * s, 0.09 * s);
+        let (hx0, hy0, hx1, hy1) = (cx + r * 0.72, cy + r * 0.72, 0.88 * s, 0.88 * s);
+        for y in 0..size {
+            for x in 0..size {
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                let ring = (((px - cx).powi(2) + (py - cy).powi(2)).sqrt() - r).abs() - th / 2.0;
+                // Distance au segment du manche.
+                let (dx, dy) = (hx1 - hx0, hy1 - hy0);
+                let t = (((px - hx0) * dx + (py - hy0) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+                let seg = ((px - hx0 - t * dx).powi(2) + (py - hy0 - t * dy).powi(2)).sqrt() - th * 0.65;
+                let a = (0.5 - ring.min(seg)).clamp(0.0, 1.0);
+                let v = (a * 255.0) as u8;
+                let i = ((y * size + x) * 4) as usize;
+                img.data[i..i + 4].copy_from_slice(&[v, v, v, v]);
+            }
+        }
+        img
+    }
+
     // ---------------------------------------------------------- menus
 
     fn text_width(&self, s: &str, px: f32) -> f32 {
@@ -869,7 +1276,7 @@ impl App {
     }
 
     fn thumb_at(&self, y: f32) -> Option<usize> {
-        let y = y - self.bar_h() + self.sidebar_scroll;
+        let y = y - self.top_h() + self.sidebar_scroll;
         let i = self.thumb_y.partition_point(|&t| t <= y).checked_sub(1)?;
         (i < self.engine().page_count).then_some(i)
     }
@@ -906,6 +1313,62 @@ impl App {
         let ctrl = self.modifiers.control_key();
         let alt = self.modifiers.alt_key();
 
+        // Ctrl+F : champ de recherche ; F3 / Maj+F3 : résultat suivant / précédent.
+        if ctrl && matches!(logical, Key::Character(c) if c.eq_ignore_ascii_case("f")) {
+            self.open_search();
+            return;
+        }
+        // Résultat suivant / précédent : Ctrl+G / Ctrl+Maj+G, F3 / Maj+F3.
+        let next_key = logical == Key::Named(NamedKey::F3)
+            || (ctrl && matches!(logical, Key::Character(c) if c.eq_ignore_ascii_case("g")));
+        if next_key && self.search_open {
+            self.search_step(!shift);
+            return;
+        }
+        // Saisie dans le champ de recherche (recherche pendant la frappe).
+        if self.search_focus {
+            let before = self.search_text.clone();
+            let take = |me: &mut Self| {
+                if me.search_fresh {
+                    me.search_text.clear();
+                }
+                me.search_fresh = false;
+            };
+            match logical {
+                Key::Named(NamedKey::Enter) => {
+                    self.search_fresh = false;
+                    self.search_step(!shift);
+                }
+                Key::Named(NamedKey::Escape) => self.close_search(),
+                Key::Named(NamedKey::ArrowDown) => self.search_step(true),
+                Key::Named(NamedKey::ArrowUp) => self.search_step(false),
+                Key::Named(NamedKey::Backspace) => {
+                    take(self);
+                    self.search_text.pop();
+                }
+                Key::Character(c) if ctrl && c.eq_ignore_ascii_case("v") => {
+                    if let Some(t) = self.clipboard().and_then(|cb| cb.get_text().ok()) {
+                        take(self);
+                        self.search_text.push_str(t.lines().next().unwrap_or(""));
+                    }
+                }
+                Key::Character(c) if ctrl && c.eq_ignore_ascii_case("a") => self.search_fresh = true,
+                Key::Character(c) if !ctrl => {
+                    take(self);
+                    self.search_text.push_str(c);
+                }
+                Key::Named(NamedKey::Space) => {
+                    take(self);
+                    self.search_text.push(' ');
+                }
+                _ => {}
+            }
+            if self.search_text != before {
+                self.search_update();
+            }
+            self.request_redraw();
+            return;
+        }
         // Saisie d'un numéro de page.
         if let Some(input) = self.goto.as_mut() {
             match logical {
@@ -938,10 +1401,14 @@ impl App {
         }
         // Échap : ferme d'abord les fenêtres, menus et la sélection.
         if logical == Key::Named(NamedKey::Escape)
-            && (self.props.is_some() || self.menu.is_some() || self.selection.is_some())
+            && (self.props.is_some()
+                || self.menu.is_some()
+                || self.selection.is_some()
+                || self.search_open)
         {
-            if self.props.take().is_none() && self.menu.take().is_none() {
-                self.selection = None;
+            if self.props.take().is_none() && self.menu.take().is_none() && self.selection.take().is_none() {
+                // Puis la recherche (barre et résultats surlignés).
+                self.close_search();
             }
             self.request_redraw();
             return;
@@ -998,6 +1465,7 @@ impl App {
     /// Ouvre le champ de page : avec `initial` (chiffre tapé), ou vide
     /// (`g`, Ctrl+G) ; sans contenu, il montre la page courante sélectionnée.
     fn open_goto(&mut self, initial: String) {
+        self.search_focus = false;
         self.goto_fresh = initial.is_empty();
         self.goto = Some(if initial.is_empty() { (self.current + 1).to_string() } else { initial });
         self.request_redraw();
@@ -1024,13 +1492,18 @@ impl App {
             MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32, false),
         };
         let (cx, cy) = self.cursor;
-        if cy < self.bar_h() {
+        if cy < self.top_h() {
             return;
         }
         if cx < self.sidebar_width() {
             let step = if lines { dy * 120.0 * self.scale_factor } else { dy };
-            self.sidebar_scroll -= step;
-            self.clamp_sidebar();
+            if self.search_open {
+                self.results_scroll -= step;
+                self.clamp_results();
+            } else {
+                self.sidebar_scroll -= step;
+                self.clamp_sidebar();
+            }
             self.request_redraw();
             return;
         }
@@ -1122,9 +1595,9 @@ impl App {
         if self.engine.is_none() || self.props.is_some() {
             return;
         }
-        let icon = if self.page_field().contains(x, y) {
+        let icon = if self.page_field().contains(x, y) || self.search_field().contains(x, y) {
             CursorIcon::Text
-        } else if y < self.bar_h() || x < self.sidebar_width() {
+        } else if y < self.top_h() || x < self.sidebar_width() {
             CursorIcon::Default
         } else if self.link_at(x, y).is_some() {
             CursorIcon::Pointer
@@ -1191,6 +1664,34 @@ impl App {
                     self.open_goto(String::new());
                     return;
                 }
+                if self.search_toggle().contains(x, y) {
+                    if self.search_open { self.close_search() } else { self.open_search() }
+                    return;
+                }
+                if self.search_open {
+                    if self.search_field().contains(x, y) {
+                        self.open_search();
+                        return;
+                    }
+                    let [prev, next, case, words] = self.search_buttons();
+                    if prev.contains(x, y) || next.contains(x, y) {
+                        self.search_step(next.contains(x, y));
+                        return;
+                    }
+                    if case.contains(x, y) || words.contains(x, y) {
+                        if case.contains(x, y) {
+                            self.search_case = !self.search_case;
+                        } else {
+                            self.search_words = !self.search_words;
+                        }
+                        self.search_update();
+                        return;
+                    }
+                }
+                if self.search_focus {
+                    self.search_focus = false;
+                    self.request_redraw();
+                }
                 // Un clic ailleurs annule la saisie de page.
                 if self.goto.take().is_some() {
                     self.request_redraw();
@@ -1199,8 +1700,8 @@ impl App {
                     self.toggle_sidebar();
                     return;
                 }
-                if y < self.bar_h() {
-                    return; // reste de la barre
+                if y < self.top_h() {
+                    return; // reste des barres
                 }
                 if x >= self.sidebar_width() {
                     let anchor = self.page_text().and_then(|t| {
@@ -1235,7 +1736,7 @@ impl App {
                 self.press = None;
                 self.dragging = false;
                 self.set_cursor(CursorIcon::Default);
-                if !was_drag && x >= self.sidebar_width() && y >= self.bar_h() && self.props.is_none() {
+                if !was_drag && x >= self.sidebar_width() && y >= self.top_h() && self.props.is_none() {
                     self.open_context_menu(x, y);
                 }
             }
@@ -1298,6 +1799,16 @@ impl App {
         self.update_overlay_textures();
         self.prepare_ui_texts();
         let sel_rects = self.selection_rects();
+        let found_rects = self.search_rects();
+        if self.loupe.is_none() {
+            let g = self.gpu.as_ref().unwrap();
+            let img = Self::make_loupe((self.bar_item_h() * 0.72).round() as u32);
+            self.loupe = Some(g.upload(img.w, img.h, &img.data, false));
+            let sz = (self.bar_item_h() * 0.7).round() as u32;
+            let (u, d) = (Self::make_chevron(sz, true), Self::make_chevron(sz, false));
+            self.chevrons = Some((g.upload(u.w, u.h, &u.data, false), g.upload(d.w, d.h, &d.data, false)));
+        }
+        self.prepare_result_textures();
 
         // Liste des éléments à dessiner.
         let g = self.gpu.as_ref().unwrap();
@@ -1309,6 +1820,11 @@ impl App {
         }
         for (key, dest) in &tile_draws {
             items.push(Draw { tex: &self.tiles[key], dest: *dest, tint: WHITE, rot: self.rotation });
+        }
+        // Résultats de recherche : jaune ; résultat courant : orange.
+        for (dest, cur) in &found_rects {
+            let tint = if *cur { [0.55, 0.25, 0.0, 0.55] } else { [0.4, 0.36, 0.0, 0.4] };
+            items.push(Draw { tex: g.white(), dest: *dest, tint, rot: 0 });
         }
         // Sélection : bleu translucide (prémultiplié).
         for dest in &sel_rects {
@@ -1384,6 +1900,13 @@ impl App {
         let px = self.text_px();
         let mut v = vec![("Options".to_string(), px), (self.page_total_label(), px)];
         v.push((self.goto.clone().unwrap_or_else(|| (self.current + 1).to_string()), px));
+        v.push((self.search_shown().0, px));
+        v.push(("Aa".to_string(), px));
+        v.push(("Mots entiers".to_string(), px));
+        v.push(("aucun résultat".to_string(), px));
+        if let Some(l) = self.search_label() {
+            v.push((l, px));
+        }
         if let Some(m) = &self.menu {
             v.extend(m.items.iter().map(|(l, _)| (l.clone(), px)));
         }
@@ -1415,6 +1938,21 @@ impl App {
         if self.ui_text.len() > 256 {
             self.ui_text.clear(); // textes devenus inutiles (messages, propriétés)
         }
+    }
+
+    /// Texte affiché dans le champ de recherche (et s'il s'agit de l'aide).
+    fn search_shown(&self) -> (String, bool) {
+        if self.search_text.is_empty() {
+            return (if self.search_focus { String::new() } else { "Rechercher dans le document".to_string() }, true);
+        }
+        let px = self.text_px();
+        let max = self.search_field().w - px * 1.2;
+        let chars: Vec<char> = self.search_text.chars().collect();
+        let mut start = 0;
+        while start < chars.len() && self.text_width(&chars[start..].iter().collect::<String>(), px) > max {
+            start += 1;
+        }
+        (chars[start..].iter().collect(), false)
     }
 
     fn ui_tex(&self, s: &str, px: f32) -> Option<&Tex> {
@@ -1462,6 +2000,62 @@ impl App {
         }
         let total = self.page_total_label();
         label(items, &total, px, f.x + f.w + px * 0.5, ty, [0.8, 0.8, 0.8, 0.8]);
+        // Loupe de la barre d'outils (bleue quand la recherche est ouverte).
+        let lb = self.search_toggle();
+        let hv = lb.contains(self.cursor.0, self.cursor.1);
+        let bg = if self.search_open { [0.16, 0.36, 0.7, 1.0] } else if hv { [0.2, 0.2, 0.23, 1.0] } else { [0.13, 0.13, 0.15, 1.0] };
+        items.push(plain(g.white(), lb, bg));
+        let icon = |items: &mut Vec<Draw<'a>>, t: &'a Tex, r: Rect| {
+            let d = Rect::new((r.x + (r.w - t.w as f32) / 2.0).round(), (r.y + (r.h - t.h as f32) / 2.0).round(), t.w as f32, t.h as f32);
+            items.push(plain(t, d, [0.9, 0.9, 0.9, 1.0]));
+        };
+        if let Some(t) = &self.loupe {
+            icon(items, t, lb);
+        }
+        // Barre de recherche.
+        if self.search_open {
+            let bh = self.bar_h();
+            items.push(plain(g.white(), Rect::new(0.0, bh, ww as f32, bh), [0.1, 0.1, 0.11, 1.0]));
+            items.push(plain(g.white(), Rect::new(0.0, 2.0 * bh - 1.0, ww as f32, 1.0), [0.2, 0.2, 0.22, 1.0]));
+            let sf = self.search_field();
+            items.push(plain(g.white(), sf, if self.search_focus { [0.95, 0.95, 0.95, 1.0] } else { [0.16, 0.16, 0.18, 1.0] }));
+            let (shown, placeholder) = self.search_shown();
+            let stx = sf.x + px * 0.5;
+            let sty = sf.y + (sf.h - px * 1.3) / 2.0;
+            let sw = self.text_width(&shown, px);
+            if self.search_focus && self.search_fresh && !placeholder {
+                items.push(plain(g.white(), Rect::new(stx - 2.0, sf.y + 4.0, sw + 4.0, sf.h - 8.0), [0.16, 0.36, 0.7, 1.0]));
+            }
+            let ink = if placeholder {
+                [0.5, 0.5, 0.52, 0.6]
+            } else if self.search_focus && !self.search_fresh {
+                [0.0, 0.0, 0.0, 1.0]
+            } else {
+                [0.95, 0.95, 0.95, 0.95]
+            };
+            label(items, &shown, px, stx, sty, ink);
+            if self.search_focus && !self.search_fresh {
+                let cx = if placeholder { stx } else { stx + sw + 1.0 };
+                items.push(plain(g.white(), Rect::new(cx, sf.y + 5.0, 2.0, sf.h - 10.0), [0.0, 0.0, 0.0, 1.0]));
+            }
+            let [prev, next, case, words] = self.search_buttons();
+            for (r, on) in [(prev, false), (next, false), (case, self.search_case), (words, self.search_words)] {
+                let hv = r.contains(self.cursor.0, self.cursor.1);
+                let bg = if on { [0.16, 0.36, 0.7, 1.0] } else if hv { [0.2, 0.2, 0.23, 1.0] } else { [0.13, 0.13, 0.15, 1.0] };
+                items.push(plain(g.white(), r, bg));
+            }
+            if let Some((up, down)) = &self.chevrons {
+                icon(items, up, prev);
+                icon(items, down, next);
+            }
+            for (t, r) in [("Aa", case), ("Mots entiers", words)] {
+                let w = self.text_width(t, px);
+                label(items, t, px, r.x + (r.w - w) / 2.0, sty, WHITE);
+            }
+            if let Some(l) = self.search_label() {
+                label(items, &l, px, words.x + words.w + px, sty, [0.8, 0.8, 0.8, 0.8]);
+            }
+        }
         // Bouton « Options ».
         let b = self.options_button();
         let hover = b.contains(self.cursor.0, self.cursor.1) || self.menu.as_ref().is_some_and(|m| m.items.len() == 6);
@@ -1536,7 +2130,7 @@ impl App {
 
     fn visible_thumbs(&self, h: f32) -> (usize, usize) {
         let n = self.engine().page_count;
-        let top = self.bar_h();
+        let top = self.top_h();
         let first = self.thumb_at(top).unwrap_or(0);
         let last = self.thumb_at(top + h - 1.0).unwrap_or(n - 1);
         (first, last.min(n - 1))
@@ -1549,8 +2143,12 @@ impl App {
         let g = self.gpu.as_ref().unwrap();
         let w = self.sidebar_width();
         let h = self.area().h;
-        let top = self.bar_h();
+        let top = self.top_h();
         items.push(Draw { tex: g.white(), dest: Rect::new(0.0, top, w, h), tint: [0.09, 0.09, 0.1, 1.0], rot: 0 });
+        if self.search_open {
+            self.push_results(items, top, w, h);
+            return;
+        }
         let tw = self.opts.config.thumb_width as f32;
         let (first, last) = self.visible_thumbs(h);
         for p in first..=last {
@@ -1679,7 +2277,7 @@ impl App {
                 if self.thumb_y.len() > p {
                     self.sidebar_scroll = (self.thumb_y[p] - 50.0).max(0.0);
                     self.clamp_sidebar();
-                    let y = self.thumb_y[p] - self.sidebar_scroll + self.bar_h() + 10.0;
+                    let y = self.thumb_y[p] - self.sidebar_scroll + self.top_h() + 10.0;
                     self.click(SIDEBAR_PAD + 10.0, y);
                 }
             }
@@ -1782,6 +2380,35 @@ impl App {
                     image
                 );
             }
+            Action::Search(q) => {
+                self.script_key(el, "ctrl+f");
+                for c in q.chars() {
+                    if c == ' ' { self.script_key(el, "Space") } else { self.script_key(el, &c.to_string()) }
+                }
+                eprintln!(
+                    "[script] recherche « {q} » : {:?} ; page {}",
+                    self.search_label(),
+                    self.current + 1
+                );
+            }
+            Action::Result(i) => {
+                if self.search_open && i < self.search_results.len() {
+                    self.reveal_result(i);
+                    let y = self.top_h() + SIDEBAR_PAD / 2.0 + (i as f32 + 0.5) * self.result_item_h() - self.results_scroll;
+                    self.on_cursor(SIDEBAR_PAD + 10.0, y);
+                    self.mouse_button(MouseButton::Left, ElementState::Pressed);
+                    self.mouse_button(MouseButton::Left, ElementState::Released);
+                    eprintln!("[script] résultat {i} → {:?} ; page {}", self.search_label(), self.current + 1);
+                }
+            }
+            Action::SearchButton(which) => {
+                let [prev, next, case, words] = self.search_buttons();
+                let r = match which.as_str() { "prev" => prev, "case" => case, "words" => words, _ => next };
+                self.on_cursor(r.x + r.w / 2.0, r.y + r.h / 2.0);
+                self.mouse_button(MouseButton::Left, ElementState::Pressed);
+                self.mouse_button(MouseButton::Left, ElementState::Released);
+                eprintln!("[script] bouton {which} → {:?} ; page {}", self.search_label(), self.current + 1);
+            }
             Action::PageField | Action::SidebarButton => {
                 let r = if matches!(a_ref, Action::PageField) { self.page_field() } else { self.sidebar_button() };
                 self.on_cursor(r.x + r.w / 2.0, r.y + r.h / 2.0);
@@ -1841,6 +2468,7 @@ impl App {
             "Backspace" => named(NamedKey::Backspace),
             "F1" => named(NamedKey::F1),
             "F9" => named(NamedKey::F9),
+            "F3" => named(NamedKey::F3),
             // Touche physique 0 d'un clavier AZERTY : la touche logique est « à ».
             "Digit0" => (Key::Character("à"), PhysicalKey::Code(KeyCode::Digit0)),
             c => (Key::Character(c), PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified)),
@@ -1951,6 +2579,17 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         if self.engine.is_none() {
             return;
+        }
+        // Recherche lancée avant la fin de l'extraction du texte : la refaire.
+        if self.search_partial && !self.search_query.is_empty() {
+            let (done, total) = self.engine().text_progress();
+            if done == total {
+                let keep = self.search_cur;
+                self.search_update();
+                if let Some(i) = keep.filter(|&i| i < self.search_results.len()) {
+                    self.search_cur = Some(i);
+                }
+            }
         }
         // Pré-envoi au GPU des pages ±1 (une par passage) : page ±1 sans envoi.
         let cur = self.current;

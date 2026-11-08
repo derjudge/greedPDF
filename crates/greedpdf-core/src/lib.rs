@@ -235,3 +235,157 @@ impl PageText {
         if nearest { best.map(|(_, i)| i) } else { None }
     }
 }
+
+/// Normalisation pour la recherche : minuscules, sans accents (un caractère
+/// donne toujours un caractère, pour garder la correspondance avec la page).
+pub fn fold_char(c: char) -> char {
+    fold_char_opt(c, false)
+}
+
+/// Comme `fold_char`, en gardant la casse si `keep_case` (accents toujours retirés).
+pub fn fold_char_opt(c: char, keep_case: bool) -> char {
+    if keep_case {
+        let lower = fold_char_opt(c, false);
+        let upper_src = c.to_lowercase().next().unwrap_or(c) != c;
+        return if upper_src { lower.to_uppercase().next().unwrap_or(lower) } else { lower };
+    }
+    let c = c.to_lowercase().next().unwrap_or(c);
+    match c {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => 'a',
+        'ç' => 'c',
+        'è' | 'é' | 'ê' | 'ë' => 'e',
+        'ì' | 'í' | 'î' | 'ï' => 'i',
+        'ñ' => 'n',
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' => 'o',
+        'ù' | 'ú' | 'û' | 'ü' => 'u',
+        'ý' | 'ÿ' => 'y',
+        '’' | '‘' => '\'',
+        '\u{a0}' | '\t' => ' ',
+        _ => c,
+    }
+}
+
+impl PageText {
+    /// Extrait autour des caractères `a..=b` : (avant, occurrence, après),
+    /// fins de ligne remplacées par des espaces, `ctx` caractères de chaque côté.
+    pub fn context(&self, a: usize, b: usize, ctx: usize) -> (String, String, String) {
+        let piece = |r: std::ops::Range<usize>| -> String {
+            let mut s = String::new();
+            for ch in &self.chars[r] {
+                if ch.eol && (ch.c == '-' || ch.c == '\u{ad}') {
+                    continue;
+                }
+                s.push(if ch.c.is_whitespace() { ' ' } else { ch.c });
+                if ch.eol {
+                    s.push(' ');
+                }
+            }
+            s.split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        let n = self.chars.len();
+        let (a, b) = (a.min(n.saturating_sub(1)), b.min(n.saturating_sub(1)));
+        let before = piece(a.saturating_sub(ctx)..a);
+        let after = piece((b + 1).min(n)..(b + 1 + ctx).min(n));
+        let mid = piece(a..b + 1);
+        let sp = |c: Option<&TextChar>| c.is_some_and(|c| c.eol || c.c.is_whitespace());
+        let before = if before.is_empty() { before } else if sp(a.checked_sub(1).and_then(|i| self.chars.get(i))) { before + " " } else { before };
+        let gap_after = sp(self.chars.get(b)) || sp(self.chars.get(b + 1));
+        let after = if after.is_empty() || !gap_after { after } else { format!(" {after}") };
+        (before, mid, after)
+    }
+
+    /// Occurrences de `query` (déjà normalisée par `fold_char`, espaces
+    /// réduits) : intervalles de caractères (inclus). Les fins de ligne
+    /// comptent comme une espace ; une coupure en fin de ligne (« -») est ignorée.
+    pub fn find(&self, query: &[char]) -> Vec<(usize, usize)> {
+        self.find_opt(query, false, false)
+    }
+
+    /// Recherche avec options : respecter la casse, mots entiers seulement
+    /// (la requête doit avoir été préparée avec la même option de casse).
+    pub fn find_opt(&self, query: &[char], case: bool, whole_words: bool) -> Vec<(usize, usize)> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        // Texte normalisé et correspondance vers les caractères de la page.
+        let mut hay: Vec<char> = Vec::with_capacity(self.chars.len() + 64);
+        let mut map: Vec<usize> = Vec::with_capacity(self.chars.len() + 64);
+        for (i, ch) in self.chars.iter().enumerate() {
+            let f = fold_char_opt(ch.c, case);
+            if ch.eol && (f == '-' || f == '\u{ad}') {
+                continue; // mot coupé en fin de ligne
+            }
+            if f == ' ' && hay.last() == Some(&' ') {
+                continue;
+            }
+            hay.push(f);
+            map.push(i);
+            if ch.eol && hay.last() != Some(&' ') {
+                hay.push(' ');
+                map.push(i);
+            }
+        }
+        let mut out = Vec::new();
+        let n = query.len();
+        let mut i = 0;
+        while i + n <= hay.len() {
+            let word = |c: Option<&char>| c.is_some_and(|c| c.is_alphanumeric());
+            let bounded = !whole_words || (!word(i.checked_sub(1).and_then(|j| hay.get(j))) && !word(hay.get(i + n)));
+            if hay[i..i + n] == *query && bounded {
+                out.push((map[i], map[i + n - 1]));
+                i += n;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+}
+
+/// Prépare une requête de recherche : normalisée, espaces réduits.
+pub fn fold_query(q: &str) -> Vec<char> {
+    fold_query_opt(q, false)
+}
+
+pub fn fold_query_opt(q: &str, case: bool) -> Vec<char> {
+    let mut v: Vec<char> = Vec::new();
+    for c in q.trim().chars().map(|c| fold_char_opt(c, case)) {
+        if c == ' ' && v.last() == Some(&' ') {
+            continue;
+        }
+        v.push(c);
+    }
+    v
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    fn page(text: &str) -> PageText {
+        let mut p = PageText::default();
+        for (i, c) in text.chars().enumerate() {
+            let eol = c == '|';
+            let c = if eol { '-' } else { c };
+            p.chars.push(TextChar { c, x0: i as f32, y0: 0.0, x1: i as f32 + 1.0, y1: 1.0, eol, eob: false });
+        }
+        p
+    }
+
+    #[test]
+    fn recherche() {
+        let p = page("Une Épée et une épée");
+        assert_eq!(p.find(&fold_query("EPEE")), vec![(4, 7), (16, 19)]);
+        // « épé| » + « e » : mot coupé en fin de ligne.
+        let p = page("une épé|e");
+        assert_eq!(p.find(&fold_query("epee")), vec![(4, 8)]);
+        assert!(p.find(&fold_query("")).is_empty());
+        // Casse et mots entiers.
+        let p = page("Fate fate fateful");
+        assert_eq!(p.find_opt(&fold_query_opt("Fate", true), true, false), vec![(0, 3)]);
+        assert_eq!(p.find_opt(&fold_query_opt("fate", false), false, true), vec![(0, 3), (5, 8)]);
+        let (b, m, a) = p.context(5, 8, 5);
+        assert_eq!((b.as_str(), m.as_str(), a.as_str()), ("Fate ", "fate", " fate"));
+    }
+}
+

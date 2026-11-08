@@ -577,6 +577,12 @@ impl Engine {
         self.shared.texts.lock().unwrap().get(page).cloned().flatten()
     }
 
+    /// (pages dont le texte est extrait, nombre de pages).
+    pub fn text_progress(&self) -> (usize, usize) {
+        let t = self.shared.texts.lock().unwrap();
+        (t.iter().filter(|x| x.is_some()).count(), t.len())
+    }
+
     pub fn metadata(&self) -> Vec<(String, String)> {
         self.shared.metadata.lock().unwrap().clone()
     }
