@@ -5,7 +5,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use greedpdf_core::{DocSource, LinkTarget, PageText, page_px};
+use backend_mupdf::{MupdfBackend, PageImage};
+use greedpdf_core::{Backend, DocSource, LinkTarget, PageText, PixelBuf, page_px};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
@@ -28,11 +29,17 @@ pub enum UserEvent {
     Thumb(usize),
     /// Message temporaire affiché au-dessus de la barre d'état.
     Toast(String),
+    /// Image extraite à copier dans le presse-papiers (avec le message à afficher).
+    CopyPixels(PixelBuf, String),
 }
 
 /// Commandes des menus (clic droit, bouton « Options »).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Cmd {
+    /// Image sous le curseur (seule, résolution d'origine).
+    CopyEmbedded,
+    SaveEmbedded,
+    /// Page entière comme image.
     CopyImage,
     SaveImage,
     CopyText,
@@ -130,6 +137,8 @@ pub enum Action {
     Clip,
     /// Enregistre l'image de la page à ce chemin (sans boîte de dialogue).
     SaveImage(String),
+    /// Enregistre l'image visée par le dernier clic droit (sans boîte de dialogue).
+    SaveEmbedded(String),
     /// Clic sur « Copier » dans la fenêtre des propriétés.
     PropsCopy,
     /// Ctrl+F puis saisie du mot (par les vrais gestionnaires ; la recherche
@@ -186,6 +195,7 @@ pub fn parse_script(s: &str) -> anyhow::Result<Vec<Action>> {
                 "menu" => Action::MenuItem(parts.get(1).unwrap_or(&"").to_string()),
                 "clip" => Action::Clip,
                 "saveimage" => Action::SaveImage(parts.get(1).unwrap_or(&"page.png").to_string()),
+                "saveembedded" => Action::SaveEmbedded(parts.get(1).unwrap_or(&"image.png").to_string()),
                 "propscopy" => Action::PropsCopy,
                 "pagefield" => Action::PageField,
                 "rotbtn" => Action::RotateButton(parts.get(1).unwrap_or(&"right").to_string()),
@@ -269,6 +279,11 @@ pub struct App {
     cross: Option<Tex>,
     /// Icônes de rotation : anti-horaire, horaire.
     rot_icons: Option<(Tex, Tex)>,
+    /// MuPDF dans le fil de l'interface (liste des images d'une page, à la demande).
+    ui_mupdf: Option<MupdfBackend>,
+    page_images: HashMap<usize, Vec<PageImage>>,
+    /// Image visée par le menu contextuel : (page, index, position).
+    menu_image: Option<(usize, usize, PageImage)>,
     modifiers: ModifiersState,
     cursor: (f32, f32),
     press: Option<((f32, f32), (f32, f32))>,
@@ -344,6 +359,9 @@ impl App {
             chevrons: None,
             cross: None,
             rot_icons: None,
+            ui_mupdf: None,
+            page_images: HashMap::new(),
+            menu_image: None,
             modifiers: ModifiersState::empty(),
             cursor: (0.0, 0.0),
             press: None,
@@ -819,6 +837,69 @@ impl App {
         }
     }
 
+    /// Image de la page courante sous le point (x, y) de l'écran : la plus
+    /// petite qui le contient (une illustration plutôt que le fond de page).
+    fn image_at(&mut self, x: f32, y: f32) -> Option<(usize, usize, PageImage)> {
+        let page = self.current;
+        if !self.page_images.contains_key(&page) {
+            if self.ui_mupdf.is_none() {
+                self.ui_mupdf = MupdfBackend::open(&self.src).ok();
+            }
+            let imgs = self.ui_mupdf.as_mut()?.images(page).unwrap_or_default();
+            if self.page_images.len() > 64 {
+                self.page_images.clear();
+            }
+            self.page_images.insert(page, imgs);
+        }
+        let (px, py) = self.screen_to_page(x, y);
+        self.page_images[&page]
+            .iter()
+            .enumerate()
+            .filter(|(_, im)| im.w > 0 && px >= im.x0 && px <= im.x1 && py >= im.y0 && py <= im.y1)
+            .min_by(|a, b| {
+                let area = |im: &PageImage| (im.x1 - im.x0) * (im.y1 - im.y0);
+                area(a.1).total_cmp(&area(b.1))
+            })
+            .map(|(i, im)| (page, i, *im))
+    }
+
+    /// Copie l'image sous le curseur (extraite hors du fil de l'interface).
+    fn copy_embedded(&mut self) {
+        let Some((page, idx, _)) = self.menu_image else { return };
+        let (src, proxy) = (self.src.clone(), self.proxy.clone());
+        self.toast("Extraction de l'image…");
+        std::thread::spawn(move || {
+            let ev = match MupdfBackend::open(&src).and_then(|mut m| m.extract_image(page, idx)) {
+                Ok(px) => {
+                    let msg = format!("Image copiée ({}×{})", px.w, px.h);
+                    UserEvent::CopyPixels(px, msg)
+                }
+                Err(e) => UserEvent::Toast(format!("Extraction impossible : {e:#}")),
+            };
+            let _ = proxy.send_event(ev);
+        });
+    }
+
+    /// Enregistre l'image sous le curseur, seule et dans sa résolution
+    /// d'origine (PNG, transparence conservée). `path` : sans boîte de dialogue.
+    fn save_embedded(&mut self, path: Option<std::path::PathBuf>) {
+        let Some((page, idx, _)) = self.menu_image else { return };
+        let (src, proxy) = (self.src.clone(), self.proxy.clone());
+        let stem = src.path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let name = format!("{stem}_page{}_image{}.png", page + 1, idx + 1);
+        std::thread::spawn(move || {
+            let Some(target) = path.or_else(|| save_dialog(&name, "Enregistrer l'image")) else { return };
+            let res = MupdfBackend::open(&src)
+                .and_then(|mut m| m.extract_image(page, idx))
+                .and_then(|px| write_png(&target, &px).map(|t| (t, px.w, px.h)));
+            let msg = match res {
+                Ok((t, w, h)) => format!("Image enregistrée : {} ({w}×{h})", t.display()),
+                Err(e) => format!("Enregistrement impossible : {e:#}"),
+            };
+            let _ = proxy.send_event(UserEvent::Toast(msg));
+        });
+    }
+
     /// « Enregistrer l'image sous… » : boîte de dialogue du système, puis
     /// écriture PNG de la page (orientée comme à l'écran), hors du fil de
     /// l'interface. `path` : chemin imposé (mode script), sans boîte de dialogue.
@@ -832,35 +913,10 @@ impl App {
         let name = format!("{stem}_page{}.png", self.current + 1);
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
-            let target = path.or_else(|| {
-                let dir = std::env::var_os("HOME").map(std::path::PathBuf::from).map(|h| {
-                    let pics = h.join("Images");
-                    if pics.is_dir() { pics } else { h }
-                });
-                let mut d = rfd::FileDialog::new()
-                    .set_title("Enregistrer l'image de la page")
-                    .set_file_name(&name)
-                    .add_filter("Image PNG", &["png"]);
-                if let Some(dir) = dir {
-                    d = d.set_directory(dir);
-                }
-                d.save_file()
-            });
-            let Some(mut target) = target else { return }; // annulé
-            if target.extension().is_none() {
-                target.set_extension("png");
-            }
+            let Some(target) = path.or_else(|| save_dialog(&name, "Enregistrer la page comme image")) else { return };
             let px = rotate_pixels(&img.pixels, rot);
-            let res = (|| -> anyhow::Result<()> {
-                let file = std::io::BufWriter::new(std::fs::File::create(&target)?);
-                let mut enc = png::Encoder::new(file, px.w, px.h);
-                enc.set_color(png::ColorType::Rgba);
-                enc.set_depth(png::BitDepth::Eight);
-                enc.write_header()?.write_image_data(&px.data)?;
-                Ok(())
-            })();
-            let msg = match res {
-                Ok(()) => format!("Image enregistrée : {} ({}×{})", target.display(), px.w, px.h),
+            let msg = match write_png(&target, &px) {
+                Ok(t) => format!("Page enregistrée : {} ({}×{})", t.display(), px.w, px.h),
                 Err(e) => format!("Enregistrement impossible : {e:#}"),
             };
             let _ = proxy.send_event(UserEvent::Toast(msg));
@@ -941,6 +997,8 @@ impl App {
     fn exec(&mut self, cmd: Cmd) {
         self.menu = None;
         match cmd {
+            Cmd::CopyEmbedded => self.copy_embedded(),
+            Cmd::SaveEmbedded => self.save_embedded(None),
             Cmd::CopyImage => self.copy_image(),
             Cmd::SaveImage => self.save_image(None),
             Cmd::CopyText => self.copy_text(),
@@ -1341,8 +1399,13 @@ impl App {
         if self.selection.is_some() {
             items.push(("Copier le texte (Ctrl+C)".to_string(), Cmd::CopyText));
         }
-        items.push(("Copier l'image de la page".to_string(), Cmd::CopyImage));
-        items.push(("Enregistrer l'image sous…".to_string(), Cmd::SaveImage));
+        self.menu_image = self.image_at(x, y);
+        if self.menu_image.is_some() {
+            items.push(("Copier l'image".to_string(), Cmd::CopyEmbedded));
+            items.push(("Enregistrer l'image sous…".to_string(), Cmd::SaveEmbedded));
+        }
+        items.push(("Copier la page comme image".to_string(), Cmd::CopyImage));
+        items.push(("Enregistrer la page comme image…".to_string(), Cmd::SaveImage));
         items.push(("Tout sélectionner (Ctrl+A)".to_string(), Cmd::SelectAll));
         self.menu = Some(Menu { x, y, items, hover: None });
         self.request_redraw();
@@ -2242,6 +2305,22 @@ impl App {
         let hover = b.contains(self.cursor.0, self.cursor.1) || self.menu.as_ref().is_some_and(|m| m.items.len() == 6);
         items.push(plain(g.white(), b, if hover { [0.2, 0.2, 0.23, 0.95] } else { [0.08, 0.08, 0.09, 0.8] }));
         label(items, "Options", px, b.x + px * 0.8, b.y + (b.h - px * 1.3) / 2.0, [0.92, 0.92, 0.92, 0.92]);
+        // Cadre autour de l'image visée par le menu contextuel.
+        if let (Some(_), Some((page, _, im))) = (&self.menu, &self.menu_image) {
+            if *page == self.current {
+                let r = self.page_to_screen(im.x0, im.y0, im.x1, im.y1);
+                let t = 3.0;
+                let c = [0.16, 0.45, 0.9, 1.0];
+                for e in [
+                    Rect::new(r.x, r.y, r.w, t),
+                    Rect::new(r.x, r.y + r.h - t, r.w, t),
+                    Rect::new(r.x, r.y, t, r.h),
+                    Rect::new(r.x + r.w - t, r.y, t, r.h),
+                ] {
+                    items.push(plain(g.white(), e, c));
+                }
+            }
+        }
         // Menu.
         if let Some(m) = &self.menu {
             let (r, ih) = self.menu_geom(m);
@@ -2551,6 +2630,10 @@ impl App {
                 }
             }
             Action::SaveImage(path) => self.save_image(Some(path.into())),
+            Action::SaveEmbedded(path) => {
+                eprintln!("[script] image visée : {:?}", self.menu_image);
+                self.save_embedded(Some(path.into()));
+            }
             Action::Clip => {
                 let (text, image) = match self.clipboard() {
                     Some(c) => (c.get_text().ok(), c.get_image().ok().map(|i| (i.width, i.height))),
@@ -2756,6 +2839,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Toast(msg) => self.toast(msg),
+            UserEvent::CopyPixels(px, msg) => {
+                let data = arboard::ImageData { width: px.w as usize, height: px.h as usize, bytes: px.data.into() };
+                match self.clipboard().map(|c| c.set_image(data)) {
+                    Some(Ok(())) => self.toast(msg),
+                    Some(Err(e)) => self.toast(format!("Copie impossible : {e}")),
+                    None => {}
+                }
+            }
             UserEvent::Thumb(p) => {
                 if self.sidebar && self.engine.is_some() {
                     let (a, b) = self.visible_thumbs(self.area().h);
@@ -2845,6 +2936,33 @@ impl ApplicationHandler<UserEvent> for App {
             _ => {}
         }
     }
+}
+
+/// Boîte de dialogue « Enregistrer sous » du système (dans `~/Images` si présent).
+fn save_dialog(name: &str, title: &str) -> Option<std::path::PathBuf> {
+    let dir = std::env::var_os("HOME").map(std::path::PathBuf::from).map(|h| {
+        let pics = h.join("Images");
+        if pics.is_dir() { pics } else { h }
+    });
+    let mut d = rfd::FileDialog::new().set_title(title).set_file_name(name).add_filter("Image PNG", &["png"]);
+    if let Some(dir) = dir {
+        d = d.set_directory(dir);
+    }
+    d.save_file()
+}
+
+/// Écrit une image RGBA en PNG (extension .png ajoutée si absente).
+fn write_png(target: &std::path::Path, px: &PixelBuf) -> anyhow::Result<std::path::PathBuf> {
+    let mut target = target.to_path_buf();
+    if target.extension().is_none() {
+        target.set_extension("png");
+    }
+    let file = std::io::BufWriter::new(std::fs::File::create(&target)?);
+    let mut enc = png::Encoder::new(file, px.w, px.h);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()?.write_image_data(&px.data)?;
+    Ok(target)
 }
 
 /// Image tournée de `rot` degrés (sens horaire), pour la copie de l'image.

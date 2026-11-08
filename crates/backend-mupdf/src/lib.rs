@@ -379,3 +379,173 @@ impl MupdfBackend {
         (!s.is_empty()).then_some(s)
     }
 }
+
+/// Image placée sur une page : rectangle (points, origine en haut à gauche)
+/// et taille d'origine en pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageImage {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+    pub w: u32,
+    pub h: u32,
+}
+
+impl MupdfBackend {
+    /// Parcourt les images de la page (ordre d'apparition) avec `f(index, bloc)`.
+    fn with_images<T>(
+        &mut self,
+        page: usize,
+        mut f: impl FnMut(usize, *mut sys::fz_stext_block) -> Option<T>,
+    ) -> Result<Option<T>> {
+        let p = self.load_page(page)?;
+        let ctx = self.ctx;
+        let opts = sys::fz_stext_options {
+            flags: sys::FZ_STEXT_PRESERVE_IMAGES as i32,
+            scale: 1.0,
+            clip: sys::fz_rect { x0: 0.0, y0: 0.0, x1: 0.0, y1: 0.0 },
+        };
+        let st = ffi!(mupdf_new_stext_page_from_page(ctx, p.page, &opts))?;
+        if st.is_null() {
+            return Err(anyhow!("analyse de la page {} impossible", page + 1));
+        }
+        let mut out = None;
+        // SAFETY : listes chaînées valides jusqu'à fz_drop_stext_page.
+        unsafe {
+            let mut block = (*st).first_block;
+            let mut i = 0;
+            while !block.is_null() {
+                if (*block).type_ == sys::FZ_STEXT_BLOCK_IMAGE as i32 {
+                    if let Some(v) = f(i, block) {
+                        out = Some(v);
+                        break;
+                    }
+                    i += 1;
+                }
+                block = (*block).next;
+            }
+            sys::fz_drop_stext_page(ctx, st);
+        }
+        Ok(out)
+    }
+
+    /// Images de la page avec leur position.
+    pub fn images(&mut self, page: usize) -> Result<Vec<PageImage>> {
+        let b = self.bounds(page)?;
+        let mut v = Vec::new();
+        self.with_images(page, |_, block| -> Option<()> {
+            // SAFETY : bloc image valide pendant le parcours.
+            unsafe {
+                let r = (*block).bbox;
+                let img = (*block).u.i.image;
+                let (w, h) = if img.is_null() { (0, 0) } else { ((*img).w.max(0) as u32, (*img).h.max(0) as u32) };
+                v.push(PageImage { x0: r.x0 - b.x0, y0: r.y0 - b.y0, x1: r.x1 - b.x0, y1: r.y1 - b.y0, w, h });
+            }
+            None
+        })?;
+        Ok(v)
+    }
+
+    /// Image n° `index` de la page, dans sa résolution d'origine, en RGBA
+    /// non prémultiplié (transparence conservée, couleurs converties en RGB).
+    pub fn extract_image(&mut self, page: usize, index: usize) -> Result<PixelBuf> {
+        let ctx = self.ctx;
+        let found = self.with_images(page, |i, block| (i == index).then_some(block))?;
+        // Le bloc n'est plus valide après le parcours : on refait le rendu
+        // dans le parcours suivant, en gardant une référence sur l'image.
+        if found.is_none() {
+            return Err(anyhow!("image {index} introuvable page {}", page + 1));
+        }
+        let img = self
+            .with_images(page, |i, block| {
+                (i == index).then(|| unsafe { sys::fz_keep_image(ctx, (*block).u.i.image) })
+            })?
+            .filter(|p| !p.is_null())
+            .ok_or_else(|| anyhow!("image {index} illisible"))?;
+        let res = (|| -> Result<PixelBuf> {
+            // SAFETY : `img` est une référence détenue (fz_keep_image).
+            let (w, h) = unsafe { ((*img).w, (*img).h) };
+            if w <= 0 || h <= 0 || w > 30_000 || h > 30_000 {
+                return Err(anyhow!("taille d'image invalide {w}×{h}"));
+            }
+            let rgb = unsafe { sys::fz_device_rgb(ctx) };
+            let pix = ffi!(mupdf_new_pixmap(ctx, rgb, 0, 0, w, h, true))?;
+            if pix.is_null() {
+                return Err(anyhow!("allocation impossible"));
+            }
+            let out = (|| -> Result<PixelBuf> {
+                let stride = unsafe { sys::fz_pixmap_stride(ctx, pix) } as usize;
+                let samples = unsafe { sys::fz_pixmap_samples(ctx, pix) };
+                // Fond transparent.
+                unsafe { std::ptr::write_bytes(samples, 0, stride * h as usize) };
+                let clip = sys::fz_irect { x0: 0, y0: 0, x1: w, y1: h };
+                let dev = ffi!(mupdf_new_draw_device(ctx, pix, clip))?;
+                if dev.is_null() {
+                    return Err(anyhow!("périphérique de dessin impossible"));
+                }
+                // Carré unité de l'image → w × h pixels.
+                let ctm = sys::fz_matrix { a: w as f32, b: 0.0, c: 0.0, d: h as f32, e: 0.0, f: 0.0 };
+                let cp = unsafe { sys::fz_default_color_params };
+                let r = ffi!(mupdf_fill_image(ctx, dev, img, ctm, 1.0, cp));
+                unsafe {
+                    sys::fz_close_device(ctx, dev);
+                    sys::fz_drop_device(ctx, dev);
+                }
+                r?;
+                let row = w as usize * 4;
+                let src = unsafe { std::slice::from_raw_parts(samples, stride * h as usize) };
+                let mut buf = PixelBuf::default();
+                buf.reset(w as u32, h as u32);
+                for (dst, s) in buf.data.chunks_exact_mut(row).zip(src.chunks(stride)) {
+                    dst.copy_from_slice(&s[..row]);
+                }
+                // Masque de transparence (SMask du PDF) : MuPDF ne l'applique
+                // pas quand l'image est dessinée seule ; il devient l'alpha.
+                let mask = unsafe { (*img).mask };
+                if !mask.is_null() {
+                    if let Ok(mp) = ffi!(mupdf_get_pixmap_from_image(ctx, mask)) {
+                        if !mp.is_null() {
+                            let (mw, mh, mn) = unsafe { ((*mp).w as usize, (*mp).h as usize, (*mp).n as usize) };
+                            let ms = unsafe { sys::fz_pixmap_stride(ctx, mp) } as usize;
+                            let msamp = unsafe { std::slice::from_raw_parts(sys::fz_pixmap_samples(ctx, mp), ms * mh) };
+                            if mw > 0 && mh > 0 && mn >= 1 {
+                                let (bw, bh) = (w as usize, h as usize);
+                                for y in 0..bh {
+                                    let my = y * mh / bh;
+                                    for x in 0..bw {
+                                        let mx = x * mw / bw;
+                                        let m = msamp[my * ms + mx * mn] as u32;
+                                        let i = (y * bw + x) * 4;
+                                        let px = &mut buf.data[i..i + 4];
+                                        // Couleur prémultipliée par le masque, comme le reste.
+                                        for c in &mut px[..3] {
+                                            *c = ((*c as u32 * m + 127) / 255) as u8;
+                                        }
+                                        px[3] = ((px[3] as u32 * m + 127) / 255) as u8;
+                                    }
+                                }
+                            }
+                            unsafe { sys::fz_drop_pixmap(ctx, mp) };
+                        }
+                    }
+                }
+                // Alpha prémultiplié → alpha direct (PNG, presse-papiers).
+                for px in buf.data.chunks_exact_mut(4) {
+                    let a = px[3] as u32;
+                    if a > 0 && a < 255 {
+                        for c in &mut px[..3] {
+                            *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+                        }
+                    }
+                }
+                Ok(buf)
+            })();
+            unsafe { sys::fz_drop_pixmap(ctx, pix) };
+            out
+        })();
+        unsafe { sys::fz_drop_image(ctx, img) };
+        res
+    }
+}
+
