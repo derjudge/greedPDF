@@ -14,6 +14,7 @@ Menu clique droit sur la page :
    
 
 Molette de la souris (descent, monte)
+shift+molette : zoom
 avec drag clic droit on bouge la fénètre de visualisation (comme avec fleche gauche et fleche droite)
 avec clic gauche on selectionne le texte.
 

@@ -74,6 +74,17 @@ pub enum Action {
     Sidebar,
     /// Ouvre le champ « aller à la page » pré-rempli (sans valider).
     Type(String),
+    /// Touche, par le vrai gestionnaire : « ArrowRight », « + », « 5 »,
+    /// « alt+ArrowLeft », « ctrl+Digit0 » (touche physique 0, « à » en AZERTY).
+    KeyPress(String),
+    /// Molette (crans) au centre de la zone des pages, dans le volet, ou avec Ctrl.
+    Wheel(f32),
+    SideWheel(f32),
+    CtrlWheel(f32),
+    /// Clic de souris réel au centre du i-ième lien de la page.
+    MouseLink(usize),
+    /// Glisser de (x0, y0) à (x1, y1), coordonnées de la fenêtre.
+    Drag(f32, f32, f32, f32),
     Shot(String),
     Wait(u64),
     Quit,
@@ -103,6 +114,12 @@ pub fn parse_script(s: &str) -> anyhow::Result<Vec<Action>> {
                 "thumb" => Action::Thumb(num(1)? as usize),
                 "sidebar" => Action::Sidebar,
                 "type" => Action::Type(parts.get(1).unwrap_or(&"").to_string()),
+                "key" => Action::KeyPress(parts.get(1).unwrap_or(&"").to_string()),
+                "wheel" => Action::Wheel(num(1)?),
+                "sidewheel" => Action::SideWheel(num(1)?),
+                "ctrlwheel" => Action::CtrlWheel(num(1)?),
+                "mouselink" => Action::MouseLink(num(1)? as usize),
+                "drag" => Action::Drag(num(1)?, num(2)?, num(3)?, num(4)?),
                 "shot" => Action::Shot(parts.get(1).unwrap_or(&"capture").to_string()),
                 "wait" => Action::Wait(num(1)? as u64),
                 "quit" => Action::Quit,
@@ -478,16 +495,20 @@ impl App {
     // ---------------------------------------------------------------- clavier
 
     fn on_key(&mut self, el: &ActiveEventLoop, ev: KeyEvent) {
-        if ev.state != ElementState::Pressed {
-            return;
+        if ev.state == ElementState::Pressed {
+            self.handle_key(el, ev.logical_key.as_ref(), ev.physical_key);
         }
+    }
+
+    /// Traitement d'une touche (événement réel ou action `key:` du script).
+    fn handle_key(&mut self, el: &ActiveEventLoop, logical: Key<&str>, physical: PhysicalKey) {
         let shift = self.modifiers.shift_key();
         let ctrl = self.modifiers.control_key();
         let alt = self.modifiers.alt_key();
 
         // Saisie d'un numéro de page.
         if let Some(input) = self.goto.as_mut() {
-            match ev.logical_key.as_ref() {
+            match logical {
                 Key::Character(c) if c.chars().all(|c| c.is_ascii_digit()) => input.push_str(c),
                 Key::Named(NamedKey::Backspace) => {
                     input.pop();
@@ -508,11 +529,11 @@ impl App {
         let half = self.area().h * 0.1;
         let last = self.engine().page_count - 1;
         // Ctrl+0 sur la touche physique (sur AZERTY, la touche logique est « à »).
-        if ctrl && matches!(ev.physical_key, PhysicalKey::Code(KeyCode::Digit0 | KeyCode::Numpad0)) {
+        if ctrl && matches!(physical, PhysicalKey::Code(KeyCode::Digit0 | KeyCode::Numpad0)) {
             self.zoom_100();
             return;
         }
-        match ev.logical_key.as_ref() {
+        match logical {
             Key::Named(NamedKey::ArrowLeft) if alt => self.history(true),
             Key::Named(NamedKey::ArrowRight) if alt => self.history(false),
             Key::Named(NamedKey::ArrowRight | NamedKey::PageDown) => self.turn(1),
@@ -628,6 +649,28 @@ impl App {
             if let Some(g) = &self.gpu {
                 g.window.set_cursor(if over { CursorIcon::Pointer } else { CursorIcon::Default });
             }
+        }
+    }
+
+    /// Bouton de souris (événement réel ou action du script).
+    fn mouse_button(&mut self, button: MouseButton, state: ElementState) {
+        match (button, state) {
+            (MouseButton::Left, ElementState::Pressed) => {
+                self.press = Some((self.cursor, self.origin));
+                self.dragging = false;
+            }
+            (MouseButton::Left, ElementState::Released) => {
+                let was_drag = self.dragging;
+                self.press = None;
+                self.dragging = false;
+                if !was_drag {
+                    let (x, y) = self.cursor;
+                    self.click(x, y);
+                }
+            }
+            (MouseButton::Back, ElementState::Pressed) => self.history(true),
+            (MouseButton::Forward, ElementState::Pressed) => self.history(false),
+            _ => {}
         }
     }
 
@@ -873,6 +916,7 @@ impl App {
         if self.opts.verbose {
             eprintln!("[script] {a:?}");
         }
+        let a_ref = a.clone();
         match a {
             Action::Next => self.turn(1),
             Action::Prev => self.turn(-1),
@@ -917,6 +961,49 @@ impl App {
             }
             Action::Sidebar => self.toggle_sidebar(),
             Action::Type(t) => self.open_goto(t),
+            Action::KeyPress(k) => self.script_key(el, &k),
+            Action::Wheel(n) | Action::CtrlWheel(n) | Action::SideWheel(n) => {
+                // Passe par le vrai gestionnaire de molette, curseur placé
+                // au centre de la zone des pages (ou du volet).
+                let a = self.area();
+                let side = matches!(a_ref, Action::SideWheel(_));
+                let ctrl = matches!(a_ref, Action::CtrlWheel(_));
+                let (x, y) = if side { (self.sidebar_width() / 2.0, a.h / 2.0) } else { (a.x + a.w / 2.0, a.y + a.h / 2.0) };
+                self.on_cursor(x, y);
+                let saved = self.modifiers;
+                if ctrl {
+                    self.modifiers = ModifiersState::CONTROL;
+                }
+                self.start_nav(format!("molette {n}{}", if ctrl { " + Ctrl" } else if side { " (volet)" } else { "" }));
+                self.on_wheel(MouseScrollDelta::LineDelta(0.0, n));
+                self.modifiers = saved;
+            }
+            Action::MouseLink(i) => {
+                let links = self.engine().links(self.current).unwrap_or_default();
+                if let Some(l) = links.get(i) {
+                    let r = self.page_rect();
+                    let (_, _, d) = self.scales(self.current);
+                    let (x, y) = (r.x + (l.x0 + l.x1) / 2.0 * d, r.y + (l.y0 + l.y1) / 2.0 * d);
+                    self.on_cursor(x, y);
+                    eprintln!(
+                        "[script] souris sur le lien {i} : curseur main = {} ; clic → page {}",
+                        self.hover_link,
+                        l.target.page + 1
+                    );
+                    self.mouse_button(MouseButton::Left, ElementState::Pressed);
+                    self.mouse_button(MouseButton::Left, ElementState::Released);
+                }
+            }
+            Action::Drag(x0, y0, x1, y1) => {
+                self.start_nav(format!("glisser {x0},{y0} → {x1},{y1}"));
+                self.on_cursor(x0, y0);
+                self.mouse_button(MouseButton::Left, ElementState::Pressed);
+                for i in 1..=10 {
+                    let t = i as f32 / 10.0;
+                    self.on_cursor(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t);
+                }
+                self.mouse_button(MouseButton::Left, ElementState::Released);
+            }
             Action::Shot(name) => {
                 self.screenshot(&name);
                 return Duration::from_millis(200);
@@ -925,6 +1012,50 @@ impl App {
             Action::Quit => el.exit(),
         }
         default
+    }
+
+    /// Action `key:` : construit la touche et passe par `handle_key`.
+    fn script_key(&mut self, el: &ActiveEventLoop, spec: &str) {
+        let mut mods = ModifiersState::empty();
+        let mut name = spec;
+        loop {
+            if let Some(r) = name.strip_prefix("ctrl+") {
+                mods |= ModifiersState::CONTROL;
+                name = r;
+            } else if let Some(r) = name.strip_prefix("alt+") {
+                mods |= ModifiersState::ALT;
+                name = r;
+            } else if let Some(r) = name.strip_prefix("shift+") {
+                mods |= ModifiersState::SHIFT;
+                name = r;
+            } else {
+                break;
+            }
+        }
+        let named = |n: NamedKey| (Key::Named(n), PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified));
+        let (logical, physical) = match name {
+            "ArrowRight" => named(NamedKey::ArrowRight),
+            "ArrowLeft" => named(NamedKey::ArrowLeft),
+            "ArrowUp" => named(NamedKey::ArrowUp),
+            "ArrowDown" => named(NamedKey::ArrowDown),
+            "PageDown" => named(NamedKey::PageDown),
+            "PageUp" => named(NamedKey::PageUp),
+            "Space" => named(NamedKey::Space),
+            "Home" => named(NamedKey::Home),
+            "End" => named(NamedKey::End),
+            "Enter" => named(NamedKey::Enter),
+            "Escape" => named(NamedKey::Escape),
+            "Backspace" => named(NamedKey::Backspace),
+            "F1" => named(NamedKey::F1),
+            "F9" => named(NamedKey::F9),
+            // Touche physique 0 d'un clavier AZERTY : la touche logique est « à ».
+            "Digit0" => (Key::Character("à"), PhysicalKey::Code(KeyCode::Digit0)),
+            c => (Key::Character(c), PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified)),
+        };
+        let saved = self.modifiers;
+        self.modifiers = mods;
+        self.handle_key(el, logical, physical);
+        self.modifiers = saved;
     }
 
     /// Capture de la fenêtre (X11, outil `import` d'ImageMagick).
@@ -1077,24 +1208,9 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } if self.engine.is_some() => {
                 self.on_cursor(position.x as f32, position.y as f32)
             }
-            WindowEvent::MouseInput { state, button, .. } if self.engine.is_some() => match (button, state) {
-                (MouseButton::Left, ElementState::Pressed) => {
-                    self.press = Some((self.cursor, self.origin));
-                    self.dragging = false;
-                }
-                (MouseButton::Left, ElementState::Released) => {
-                    let was_drag = self.dragging;
-                    self.press = None;
-                    self.dragging = false;
-                    if !was_drag {
-                        let (x, y) = self.cursor;
-                        self.click(x, y);
-                    }
-                }
-                (MouseButton::Back, ElementState::Pressed) => self.history(true),
-                (MouseButton::Forward, ElementState::Pressed) => self.history(false),
-                _ => {}
-            },
+            WindowEvent::MouseInput { state, button, .. } if self.engine.is_some() => {
+                self.mouse_button(button, state)
+            }
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }

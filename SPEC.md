@@ -425,14 +425,17 @@ la 1re page, pic de RAM, puis quitte.
 ### 7.1 État mesuré (MVP, 2026-11-08 — WFRP5, 379 pages, écran 4K, machine chargée)
 
 Mesures du mode `--script` : temps entre l'action et la soumission de la frame
-au GPU (l'écran 30 Hz ajoute jusqu'à 33 ms d'affichage).
+au GPU (l'écran 30 Hz ajoute jusqu'à 33 ms d'affichage). Les actions `key:`,
+`wheel:`, `ctrlwheel:`, `sidewheel:`, `drag:` et `mouselink:` passent par les
+vrais gestionnaires du clavier et de la souris (seuls les événements du
+système de fenêtrage sont simulés).
 
 | # | Mesuré | Verdict |
 |---|--------|---------|
 | A1 | 264 à 423 ms selon la charge de la machine | ≈ objectif (dépassé quand la machine est chargée) |
 | A2 | 1,3 à 2,5 ms | ✅ |
-| A3 | 15,9 ms (page en cache) ; ~560 ms si la page n'est pas encore rendue | ✅ en cache |
-| A4 | 8,9 à 9,6 ms | ✅ |
+| A3 | 7 à 16 ms (page en cache) ; jusqu'à ~49 ms quand la page cible est à S = 1,75–2 (envoi de 42–60 Mo au GPU + mipmaps) ; ~560 ms si la page n'est pas encore rendue | ✅ / ⚠️ selon S |
+| A4 | 9 à 44 ms (même cause : taille de l'envoi au GPU) | ✅ / ⚠️ selon S |
 | A5 | flou affiché en 0,8 à 11 ms ✅ ; net en 0,3 à 1,4 s ❌ | ❌ net : chaque worker MuPDF décode les images JPEG 2000 de la page sous le verrou global de MuPDF. Piste : display list partagée (contextes clonés) |
 | A5b | 1,3 à 3,1 ms, aucun rendu | ✅ |
 | A6 | tout à S = 1 en 19,5 à 21,9 s ; à S = 1,75 en 46,5 à 47,5 s (379 pages) | mesuré (objectif à fixer) |
