@@ -63,4 +63,13 @@ système (`lp`, CUPS) ; il n'y a pas encore de boîte de dialogue d'impression.
   si d'autres programmes en ont besoin, il réduit les pages lointaines (sans
   les re-rendre), puis les libère. Le swap est un signal d'arrêt.
 
-Licence : AGPL-3.0-or-later (MuPDF est sous AGPL).
+## Licence
+
+Copyright © 2026 derjudge.
+
+greedPDF est un logiciel libre : vous pouvez le redistribuer et le modifier
+selon les termes de la **GNU Affero General Public License** publiée par la
+Free Software Foundation, version 3 ou (à votre choix) toute version
+ultérieure. Voir [`LICENSE`](LICENSE).
+
+Ce choix découle de l'utilisation de MuPDF, distribué sous AGPL.
