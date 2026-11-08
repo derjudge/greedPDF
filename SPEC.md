@@ -72,11 +72,18 @@ Les chiffres sont réservés au goto : aucune autre action n'utilise une touche
 chiffre seule (d'où `z` et `Ctrl+0` pour le zoom).
 | clic gauche sur lien | Suivre le lien |
 | `q`, `Ctrl+W` | Quitter |
+| `F9` | Afficher / masquer le volet des miniatures |
 | `F11` | Plein écran |
 
 Tous les raccourcis sont centralisés dans une table (reconfigurable en v2).
 
 ### 2.3 Interface
+
+- **Volet des miniatures** (ajouté en cours de développement, à la demande) :
+  à gauche, comme dans evince. Une miniature par page, produite gratuitement
+  en réduisant la première image rendue de la page ; numéro sous chaque
+  miniature ; la page courante est surlignée et le volet la suit ; clic sur une
+  miniature = saut (alimente l'historique) ; la molette fait défiler le volet.
 
 - Une fenêtre, la page centrée sur un fond neutre.
 - Une barre d'état discrète (masquable avec `F1`) : `page / total`, zoom %,
@@ -212,6 +219,10 @@ Règles :
   **annulée** ; celle en cours se termine mais son résultat n'est mis en cache que
   s'il reste utile.
 - Les workers tournent à priorité OS basse : le thread UI n'est jamais privé de CPU.
+- **Réserve interactive** (ajoutée après mesure) : les étapes 6 et 7 n'occupent
+  jamais plus de N − 2 workers. Un rendu en cours ne peut pas être interrompu ;
+  sans réserve, une action de l'utilisateur pendant le préchargement attendait
+  la fin d'un rendu d'arrière-plan (~0,5 s).
 - Le préchargement s'arrête quand tout est en cache **ou** quand le budget mémoire
   est atteint (pas d'activité CPU inutile une fois le document chargé).
 
@@ -224,8 +235,8 @@ physiques de l'écran. Dans cette section, « zoom ×1 » désigne cette taille
 | Niveau | Contenu | Portée |
 |--------|---------|--------|
 | **L0 (base sur-échantillonnée)** | Page entière à la taille ajustée × **S** (facteur de sur-échantillonnage, §4.4) | **Tout le document** |
-| **L1 (zoom courant)** | Page entière au zoom courant, si ≤ 4096 px de côté. Seulement quand le zoom dépasse S. | Page visible + fenêtre de ±k pages |
-| **L2 (tuiles)** | Tuiles de 512×512 px au zoom courant, quand la page dépasse 4096 px. Seulement quand le zoom dépasse S. | Tuiles visibles + couronne autour |
+| **L1 (zoom courant)** | *Non implémenté : les tuiles L2 couvrent aussi ce cas.* | — |
+| **L2 (tuiles)** | Tuiles de 1024×1024 px au palier de zoom courant, **rendues par MuPDF** (2 à 7 % du coût d'une page entière, contre 15 à 50 % pour hayro qui réinterprète toute la page). Seulement quand le zoom dépasse S. | Tuiles visibles + couronne ; haut des pages ±1 |
 
 Changement de zoom :
 - **Zoom ≤ S** : aucun rendu. L'image L0 est réduite par le GPU (mipmaps, filtrage
@@ -411,6 +422,25 @@ wgpu), au prix d'un peu plus de latence et de dépendances.
 Mode `greedpdf --bench fichier.pdf` : charge tout, affiche pages/s, temps de
 la 1re page, pic de RAM, puis quitte.
 
+### 7.1 État mesuré (MVP, 2026-11-08 — WFRP5, 379 pages, écran 4K, machine chargée)
+
+Mesures du mode `--script` : temps entre l'action et la soumission de la frame
+au GPU (l'écran 30 Hz ajoute jusqu'à 33 ms d'affichage).
+
+| # | Mesuré | Verdict |
+|---|--------|---------|
+| A1 | 264 à 423 ms selon la charge de la machine | ≈ objectif (dépassé quand la machine est chargée) |
+| A2 | 1,3 à 2,5 ms | ✅ |
+| A3 | 15,9 ms (page en cache) ; ~560 ms si la page n'est pas encore rendue | ✅ en cache |
+| A4 | 8,9 à 9,6 ms | ✅ |
+| A5 | flou affiché en 0,8 à 11 ms ✅ ; net en 0,3 à 1,4 s ❌ | ❌ net : chaque worker MuPDF décode les images JPEG 2000 de la page sous le verrou global de MuPDF. Piste : display list partagée (contextes clonés) |
+| A5b | 1,3 à 3,1 ms, aucun rendu | ✅ |
+| A6 | tout à S = 1 en 19,5 à 21,9 s ; à S = 1,75 en 46,5 à 47,5 s (379 pages) | mesuré (objectif à fixer) |
+| A7 | 77 % des 12 threads | ❌ en partie voulu (réserve interactive : 83 % au maximum) |
+| A8 | non mesuré directement ; aucune action > 60 ms pour une page en cache pendant le préchargement | partiel |
+| A9 | 10 Go pris par un autre programme : RAM système max 83,8 %, S 1,75 → 1,5, RSS 19,8 → 18,5 Go, retour à S = 1,75 après libération | ✅ |
+| A10 | 1 % d'un cœur | ✅ |
+
 ---
 
 ## 8. Organisation du code
@@ -418,20 +448,25 @@ la 1re page, pic de RAM, puis quitte.
 ```
 greedPDF/
 ├── Cargo.toml                 (workspace)
-├── SPEC.md
+├── SPEC.md, README.md
 ├── crates/
-│   ├── greedpdf/              binaire : CLI, fenêtre, raccourcis, historique
-│   ├── greedpdf-core/         Scheduler, PageCache, MemoryGovernor, types communs, trait Backend
-│   ├── greedpdf-render/       rendu wgpu (textures, zoom, tuiles)
-│   ├── backend-mupdf/         feature "mupdf"
-│   ├── backend-hayro/         feature "hayro"
-│   └── backend-pdfium/        feature "pdfium" (multi-processus)
-└── bench/                     greedpdf-bench + corpus (liens symboliques, non versionnés)
+│   ├── greedpdf/              binaire
+│   │   ├── main.rs            options, mode --bench
+│   │   ├── app.rs             interface : vue, navigation, liens, historique, volet, --script
+│   │   ├── engine.rs          workers, priorités, cache, gouverneur mémoire, miniatures
+│   │   ├── gpu.rs             wgpu : textures, mipmaps, quads
+│   │   ├── layout.rs          géométrie partagée (ajustement, paliers, tuiles)
+│   │   ├── text.rs            texte (ab_glyph, police du système)
+│   │   └── mem.rs             /proc/meminfo, /proc/vmstat, RSS
+│   ├── greedpdf-core/         trait Backend, types communs, réduction d'image
+│   ├── backend-hayro/         rendu pur Rust (pages entières)
+│   ├── backend-mupdf/         FFI directe mupdf-sys (tuiles, liens, secours)
+│   └── greedpdf-bench/        banc de test des moteurs (+ examples/ : tuiles, liens, tailles)
+└── bench/                     RESULTS.md ; corpus/ et out/ non versionnés
 ```
 
-Crates principales : `winit`, `wgpu`, `crossbeam-channel`, `parking_lot`,
-`memmap2`, `sysinfo` (ou lecture directe de `/proc`), `mimalloc`, `clap`,
-`thread-priority`, `tracing`.
+Crates principales : `winit`, `wgpu`, `hayro`, `mupdf-sys`, `memmap2`,
+`mimalloc`, `parking_lot`, `ab_glyph`, `clap`, `anyhow`, `self_cell`.
 
 ---
 
@@ -439,14 +474,14 @@ Crates principales : `winit`, `wgpu`, `crossbeam-channel`, `parking_lot`,
 
 | Jalon | Contenu | Livrable |
 |-------|---------|----------|
-| **M0** | Spike moteurs (§3.3) | Tableau de benchmarks + choix du backend |
-| **M1** | Fenêtre winit/wgpu qui affiche une page rendue | `greedpdf doc.pdf --page 12` |
-| **M2** | Pool de workers + Scheduler + PageCache (sans plafond) | Préchargement complet, page ±1 instantanée |
-| **M3** | MemoryGovernor (plafond 85 %, swap, éviction) | Test de charge A9 réussi |
-| **M4** | Goto, Home/End, barre d'état | A4 |
-| **M5** | Liens internes + historique précédent/suivant | A3 |
-| **M6** | Zoom (sur-échantillonnage adaptatif S, mipmaps, L1, tuiles L2, zoom GPU transitoire, défilement) | A5, A5b |
-| **M7** | Mode `--bench`, finitions, raccourcis complets | Tous les critères §7 |
+| **M0** ✅ | Spike moteurs (§3.3) | Tableau de benchmarks + choix du backend |
+| **M1** ✅ | Fenêtre winit/wgpu qui affiche une page rendue | `greedpdf doc.pdf --page 12` |
+| **M2** ✅ | Pool de workers + Scheduler + PageCache (sans plafond) | Préchargement complet, page ±1 instantanée |
+| **M3** ✅ | MemoryGovernor (plafond 85 %, swap, éviction) | Test de charge A9 réussi |
+| **M4** ✅ | Goto, Home/End, barre d'état | A4 |
+| **M5** ✅ | Liens internes + historique précédent/suivant | A3 |
+| **M6** ✅ (A5 net non atteint) | Zoom (sur-échantillonnage adaptatif S, mipmaps, L1, tuiles L2, zoom GPU transitoire, défilement) | A5, A5b |
+| **M7** ✅ (+ volet des miniatures, mode --script) | Mode `--bench`, finitions, raccourcis complets | Tous les critères §7 |
 
 ---
 
