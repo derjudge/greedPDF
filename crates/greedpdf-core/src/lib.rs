@@ -111,3 +111,73 @@ pub trait Backend: Sized {
     /// Liens internes de la page (les liens externes sont ignorés).
     fn links(&mut self, page: usize) -> Result<Vec<Link>>;
 }
+
+/// Réduit une image RGBA par moyenne des pixels couverts (filtre « boîte »).
+/// Utilisé pour les miniatures et pour réduire une page en cache sans la
+/// re-rendre (SPEC.md §4.4, « dégradation plutôt qu'éviction »).
+pub fn downscale(src: &PixelBuf, dw: u32, dh: u32) -> PixelBuf {
+    let (dw, dh) = (dw.clamp(1, src.w.max(1)), dh.clamp(1, src.h.max(1)));
+    let mut out = PixelBuf::default();
+    out.reset(dw, dh);
+    if src.w == 0 || src.h == 0 {
+        return out;
+    }
+    // Bornes [x0, x1) des colonnes sources couvertes par chaque colonne cible.
+    let span = |d: u32, n: u32, s: u32| -> (usize, usize) {
+        let a = (d as u64 * s as u64 / n as u64) as usize;
+        let b = (((d as u64 + 1) * s as u64).div_ceil(n as u64) as usize).max(a + 1);
+        (a, b.min(s as usize))
+    };
+    let cols: Vec<(usize, usize)> = (0..dw).map(|x| span(x, dw, src.w)).collect();
+    let stride = src.w as usize * 4;
+    let mut acc = vec![0u32; dw as usize * 4];
+    for y in 0..dh {
+        let (y0, y1) = span(y, dh, src.h);
+        acc.fill(0);
+        for sy in y0..y1 {
+            let row = &src.data[sy * stride..(sy + 1) * stride];
+            for (x, &(x0, x1)) in cols.iter().enumerate() {
+                let a = &mut acc[x * 4..x * 4 + 4];
+                for px in row[x0 * 4..x1 * 4].chunks_exact(4) {
+                    a[0] += px[0] as u32;
+                    a[1] += px[1] as u32;
+                    a[2] += px[2] as u32;
+                    a[3] += px[3] as u32;
+                }
+            }
+        }
+        let rows = (y1 - y0) as u32;
+        let dst = &mut out.data[y as usize * dw as usize * 4..(y as usize + 1) * dw as usize * 4];
+        for (x, &(x0, x1)) in cols.iter().enumerate() {
+            let n = rows * (x1 - x0) as u32;
+            for c in 0..4 {
+                dst[x * 4 + c] = ((acc[x * 4 + c] + n / 2) / n) as u8;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downscale_moyenne() {
+        let mut src = PixelBuf::default();
+        src.reset(4, 2);
+        // Colonne gauche (2 px) noire, droite blanche.
+        for y in 0..2 {
+            for x in 0..4 {
+                let v = if x < 2 { 0 } else { 255 };
+                src.data[(y * 4 + x) * 4..(y * 4 + x) * 4 + 4].copy_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let d = downscale(&src, 2, 1);
+        assert_eq!((d.w, d.h), (2, 1));
+        assert_eq!(&d.data, &[0, 0, 0, 255, 255, 255, 255, 255]);
+        let d = downscale(&src, 3, 2); // rapport non entier
+        assert_eq!((d.w, d.h), (3, 2));
+        assert_eq!(d.data[3], 255);
+    }
+}

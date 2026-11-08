@@ -10,6 +10,7 @@ backend-hayro = { version = "0.1.0", path = "../backend-hayro" }
 backend-mupdf = { version = "0.1.0", path = "../backend-mupdf" }
 clap = { version = "4.6.7", features = ["derive"] }
 greedpdf-core = { version = "0.1.0", path = "../greedpdf-core" }
+mimalloc = "0.1.52"
 pollster = "1.0.1"
 wgpu = "30.0.1"
 winit = "0.30"
