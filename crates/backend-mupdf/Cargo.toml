@@ -1,0 +1,11 @@
+[package]
+name = "backend-mupdf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+greedpdf-core = { version = "0.1.0", path = "../greedpdf-core" }
+mupdf-sys = { version = "0.8", default-features = false, features = ["base14-fonts"] }
+parking_lot = "0.12"

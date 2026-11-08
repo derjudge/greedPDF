@@ -1,0 +1,9 @@
+[package]
+name = "greedpdf-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+memmap2 = "0.9.12"

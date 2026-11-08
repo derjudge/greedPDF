@@ -1,0 +1,13 @@
+[package]
+name = "greedpdf-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+backend-hayro = { version = "0.1.0", path = "../backend-hayro" }
+backend-mupdf = { version = "0.1.0", path = "../backend-mupdf" }
+clap = { version = "4.6.7", features = ["derive"] }
+greedpdf-core = { version = "0.1.0", path = "../greedpdf-core" }
+png = "0.18.1"

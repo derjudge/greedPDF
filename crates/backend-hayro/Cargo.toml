@@ -1,0 +1,11 @@
+[package]
+name = "backend-hayro"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+greedpdf-core = { version = "0.1.0", path = "../greedpdf-core" }
+hayro = "0.9"
+self_cell = "1.3.0"
