@@ -226,6 +226,8 @@ pub struct App {
     dragging: bool,
     hover_link: bool,
     wheel_acc: f32,
+    /// Défilement poussé contre le bord de la page (molette → page ±1).
+    wheel_edge: f32,
     rotation: u32,
     selection: Option<Selection>,
     /// Clic gauche en cours sur la page : position et caractère d'ancrage.
@@ -282,6 +284,7 @@ impl App {
             dragging: false,
             hover_link: false,
             wheel_acc: 0.0,
+            wheel_edge: 0.0,
             rotation: 0,
             selection: None,
             sel_press: None,
@@ -419,12 +422,19 @@ impl App {
 
     /// Page ±1 : sans historique, affichage en haut de la page.
     fn turn(&mut self, delta: i64) {
+        self.turn_to(delta, false);
+    }
+
+    /// Page ±delta, affichée en haut (ou en bas si `bottom` : remontée à la molette).
+    fn turn_to(&mut self, delta: i64, bottom: bool) {
         let n = self.engine().page_count as i64;
         let p = (self.current as i64 + delta).clamp(0, n - 1) as usize;
         if p != self.current {
             self.start_nav(format!("page {}", p + 1));
             self.current = p;
-            self.origin.1 = 0.0;
+            // `place` borne la position : -∞ donne le bas de la page.
+            self.origin.1 = if bottom { f32::MIN / 2.0 } else { 0.0 };
+            self.wheel_edge = 0.0;
             self.after_page_change();
         }
     }
@@ -995,7 +1005,20 @@ impl App {
         }
         let step = self.area().h * 0.15;
         let (sx, sy) = if lines { (-dx * step, -dy * step) } else { (-dx, -dy) };
-        self.scroll_by(sx, sy)
+        let before = self.origin.1;
+        self.scroll_by(sx, sy);
+        // Bord de page atteint : continuer à tourner la molette change de page
+        // (l'équivalent d'un cran, pour qu'un pavé tactile ne saute pas trop vite).
+        if sy != 0.0 && (self.origin.1 - before).abs() < 0.5 {
+            self.wheel_edge += sy;
+            if self.wheel_edge >= step * 0.99 {
+                self.turn_to(1, false);
+            } else if self.wheel_edge <= -step * 0.99 {
+                self.turn_to(-1, true);
+            }
+        } else {
+            self.wheel_edge = 0.0;
+        }
     }
 
     fn on_cursor(&mut self, x: f32, y: f32) {

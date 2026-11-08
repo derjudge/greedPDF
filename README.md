@@ -21,7 +21,7 @@ cargo build --release
 
 | Action | Touches / souris |
 |---|---|
-| Page suivante / précédente | `→` `←`, `PgDown` `PgUp`, `Espace` / `Maj+Espace`, `j` `k`, `l` `h`, molette (page entière visible) |
+| Page suivante / précédente | `→` `←`, `PgDown` `PgUp`, `Espace` / `Maj+Espace`, `j` `k`, `l` `h`, molette (page entière visible ; page zoomée : un cran de plus une fois le bas ou le haut atteint) |
 | Aller à la page *n* | taper le numéro puis `Entrée` (ou `g`, `Ctrl+G`) ; `Échap` annule. **AZERTY** : chiffres avec `Maj` ou pavé numérique (sans `Maj`, la rangée du haut donne `& é " ' ( - …`, et `-` reste le zoom arrière) |
 | Début / fin | `Début` / `Fin` |
 | Précédent / suivant (historique) | `Alt+←` / `Alt+→`, `Retour arrière` / `Maj+Retour arrière`, boutons latéraux de la souris |
