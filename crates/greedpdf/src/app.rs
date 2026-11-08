@@ -34,6 +34,7 @@ pub enum UserEvent {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Cmd {
     CopyImage,
+    SaveImage,
     CopyText,
     SelectAll,
     Print,
@@ -127,6 +128,8 @@ pub enum Action {
     MenuItem(String),
     /// Affiche le contenu du presse-papiers (vérification de la copie).
     Clip,
+    /// Enregistre l'image de la page à ce chemin (sans boîte de dialogue).
+    SaveImage(String),
     /// Clic sur « Copier » dans la fenêtre des propriétés.
     PropsCopy,
     /// Ctrl+F puis saisie du mot (par les vrais gestionnaires ; la recherche
@@ -180,6 +183,7 @@ pub fn parse_script(s: &str) -> anyhow::Result<Vec<Action>> {
                 "options" => Action::Options,
                 "menu" => Action::MenuItem(parts.get(1).unwrap_or(&"").to_string()),
                 "clip" => Action::Clip,
+                "saveimage" => Action::SaveImage(parts.get(1).unwrap_or(&"page.png").to_string()),
                 "propscopy" => Action::PropsCopy,
                 "pagefield" => Action::PageField,
                 "search" => Action::Search(parts.get(1).unwrap_or(&"").to_string()),
@@ -801,6 +805,54 @@ impl App {
         }
     }
 
+    /// « Enregistrer l'image sous… » : boîte de dialogue du système, puis
+    /// écriture PNG de la page (orientée comme à l'écran), hors du fil de
+    /// l'interface. `path` : chemin imposé (mode script), sans boîte de dialogue.
+    fn save_image(&mut self, path: Option<std::path::PathBuf>) {
+        let Some(img) = self.engine().get(ImgKey::L0(self.current)) else {
+            self.toast("Page pas encore rendue");
+            return;
+        };
+        let rot = self.rotation;
+        let stem = self.src.path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let name = format!("{stem}_page{}.png", self.current + 1);
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let target = path.or_else(|| {
+                let dir = std::env::var_os("HOME").map(std::path::PathBuf::from).map(|h| {
+                    let pics = h.join("Images");
+                    if pics.is_dir() { pics } else { h }
+                });
+                let mut d = rfd::FileDialog::new()
+                    .set_title("Enregistrer l'image de la page")
+                    .set_file_name(&name)
+                    .add_filter("Image PNG", &["png"]);
+                if let Some(dir) = dir {
+                    d = d.set_directory(dir);
+                }
+                d.save_file()
+            });
+            let Some(mut target) = target else { return }; // annulé
+            if target.extension().is_none() {
+                target.set_extension("png");
+            }
+            let px = rotate_pixels(&img.pixels, rot);
+            let res = (|| -> anyhow::Result<()> {
+                let file = std::io::BufWriter::new(std::fs::File::create(&target)?);
+                let mut enc = png::Encoder::new(file, px.w, px.h);
+                enc.set_color(png::ColorType::Rgba);
+                enc.set_depth(png::BitDepth::Eight);
+                enc.write_header()?.write_image_data(&px.data)?;
+                Ok(())
+            })();
+            let msg = match res {
+                Ok(()) => format!("Image enregistrée : {} ({}×{})", target.display(), px.w, px.h),
+                Err(e) => format!("Enregistrement impossible : {e:#}"),
+            };
+            let _ = proxy.send_event(UserEvent::Toast(msg));
+        });
+    }
+
     /// Impression : envoie le fichier à l'imprimante par défaut (CUPS, `lp`).
     fn print(&mut self) {
         let path = self.src.path.clone();
@@ -876,6 +928,7 @@ impl App {
         self.menu = None;
         match cmd {
             Cmd::CopyImage => self.copy_image(),
+            Cmd::SaveImage => self.save_image(None),
             Cmd::CopyText => self.copy_text(),
             Cmd::SelectAll => self.select_all(),
             Cmd::Print => self.print(),
@@ -1231,6 +1284,7 @@ impl App {
             items.push(("Copier le texte (Ctrl+C)".to_string(), Cmd::CopyText));
         }
         items.push(("Copier l'image de la page".to_string(), Cmd::CopyImage));
+        items.push(("Enregistrer l'image sous…".to_string(), Cmd::SaveImage));
         items.push(("Tout sélectionner (Ctrl+A)".to_string(), Cmd::SelectAll));
         self.menu = Some(Menu { x, y, items, hover: None });
         self.request_redraw();
@@ -2418,6 +2472,7 @@ impl App {
                     None => eprintln!("[script] entrée de menu « {label} » introuvable"),
                 }
             }
+            Action::SaveImage(path) => self.save_image(Some(path.into())),
             Action::Clip => {
                 let (text, image) = match self.clipboard() {
                     Some(c) => (c.get_text().ok(), c.get_image().ok().map(|i| (i.width, i.height))),
