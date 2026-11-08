@@ -242,14 +242,17 @@ pub fn fold_char(c: char) -> char {
     fold_char_opt(c, false)
 }
 
+/// Diacritique combinant (ignoré par la recherche, comme les accents).
+pub fn is_mark(c: char) -> bool {
+    unicode_normalization::char::is_combining_mark(c)
+}
+
 /// Comme `fold_char`, en gardant la casse si `keep_case` (accents toujours retirés).
+/// Toute lettre est décomposée (NFD) et réduite à sa lettre de base.
 pub fn fold_char_opt(c: char, keep_case: bool) -> char {
-    if keep_case {
-        let lower = fold_char_opt(c, false);
-        let upper_src = c.to_lowercase().next().unwrap_or(c) != c;
-        return if upper_src { lower.to_uppercase().next().unwrap_or(lower) } else { lower };
-    }
-    let c = c.to_lowercase().next().unwrap_or(c);
+    use unicode_normalization::UnicodeNormalization;
+    let base = std::iter::once(c).nfd().find(|&d| !is_mark(d)).unwrap_or(c);
+    let c = if keep_case { base } else { base.to_lowercase().next().unwrap_or(base) };
     match c {
         'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => 'a',
         'ç' => 'c',
@@ -311,6 +314,14 @@ impl PageText {
         let mut hay: Vec<char> = Vec::with_capacity(self.chars.len() + 64);
         let mut map: Vec<usize> = Vec::with_capacity(self.chars.len() + 64);
         for (i, ch) in self.chars.iter().enumerate() {
+            // Diacritiques combinants (NFD, zalgo) : ignorés, comme les accents.
+            if is_mark(ch.c) {
+                if ch.eol && hay.last().is_some_and(|&c| c != ' ') {
+                    hay.push(' ');
+                    map.push(i);
+                }
+                continue;
+            }
             let f = fold_char_opt(ch.c, case);
             if ch.eol && (f == '-' || f == '\u{ad}') {
                 continue; // mot coupé en fin de ligne
@@ -349,7 +360,7 @@ pub fn fold_query(q: &str) -> Vec<char> {
 
 pub fn fold_query_opt(q: &str, case: bool) -> Vec<char> {
     let mut v: Vec<char> = Vec::new();
-    for c in q.trim().chars().map(|c| fold_char_opt(c, case)) {
+    for c in q.trim().chars().filter(|&c| !is_mark(c)).map(|c| fold_char_opt(c, case)) {
         if c == ' ' && v.last() == Some(&' ') {
             continue;
         }
@@ -380,6 +391,14 @@ mod search_tests {
         let p = page("une épé|e");
         assert_eq!(p.find(&fold_query("epee")), vec![(4, 8)]);
         assert!(p.find(&fold_query("")).is_empty());
+        // Texte décomposé (NFD) et zalgo : diacritiques combinants ignorés.
+        let p = page("nai\u{308}f e\u{301}te\u{301} z\u{336}\u{301}a\u{30a}l\u{334}g\u{350}o");
+        assert_eq!(p.find(&fold_query("naïf")).len(), 1);
+        assert_eq!(p.find(&fold_query("ETE")).len(), 1);
+        assert_eq!(p.find(&fold_query("zalgo")), vec![(12, 21)]);
+        // Lettres d'autres alphabets décomposables.
+        assert_eq!(fold_char('ệ'), 'e');
+        assert_eq!(fold_char('Ǻ'), 'a');
         // Casse et mots entiers.
         let p = page("Fate fate fateful");
         assert_eq!(p.find_opt(&fold_query_opt("Fate", true), true, false), vec![(0, 3)]);

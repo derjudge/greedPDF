@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 anyhow = "1.0.104"
 memmap2 = "0.9.12"
+unicode-normalization = "0.1.26"

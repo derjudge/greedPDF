@@ -62,3 +62,26 @@ Pistes d'amélioration ultérieures :
 - MuPDF multi-processus (≈ 32 pages/s) si un document lourd l'exige.
 - Contribuer à hayro / suivre ses optimisations (son README indique qu'aucun
   travail d'optimisation n'a encore été fait).
+
+## PDF « cauchemar » de diacritiques (`bench/gen_cauchemar.py`)
+
+100 pages générées avec Pango/HarfBuzz (14 Mo, 62 polices embarquées) :
+zalgo jusqu'à ~60 diacritiques par lettre, NFC/NFD, vietnamien, arabe
+vocalisé, hébreu avec cantillation, écritures indiennes, thaï/khmer/tibétain,
+API, marques englobantes et ZWJ, bidi, tailles de 1 à 200 pt, texte pivoté,
+couches translucides, pages de ~250 000 caractères en 1 pt ; sommaire à liens
+dont les destinations sont à mi-page.
+
+Régénérer : `python3 bench/gen_cauchemar.py bench/corpus/cauchemar_diacritiques.pdf` (~12 s).
+
+| Mesure | Résultat |
+|---|---|
+| Rendu, 12 threads | hayro 103 pages/s, MuPDF 92 pages/s ; aucune erreur |
+| Comparaison MuPDF / hayro (100 pages) | écart moyen 2,6/255 ; pire page 1,95 % de pixels différents (anti-crénelage) |
+| Texte extrait (MuPDF) | 3,78 millions de caractères en 3,3 s |
+| Liens | 14 liens, destinations avec position verticale (y = 421) : arrivée vérifiée en mode largeur |
+| Recherche | « naif » : 136 résultats (NFC **et** NFD) ; « etes » : 59 résultats, y compris dans le zalgo |
+
+Correctif issu de ce test : la recherche ignorait les accents des lettres
+précomposées seulement ; elle décompose maintenant chaque caractère (NFD) et
+ignore tous les diacritiques combinants (texte NFD, zalgo, vietnamien décomposé).
