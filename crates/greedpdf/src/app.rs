@@ -129,6 +129,9 @@ pub enum Action {
     Clip,
     /// Clic sur « Copier » dans la fenêtre des propriétés.
     PropsCopy,
+    /// Clic sur le champ de page / sur le bouton du volet (barre d'outils).
+    PageField,
+    SidebarButton,
     Shot(String),
     Wait(u64),
     Quit,
@@ -171,6 +174,8 @@ pub fn parse_script(s: &str) -> anyhow::Result<Vec<Action>> {
                 "menu" => Action::MenuItem(parts.get(1).unwrap_or(&"").to_string()),
                 "clip" => Action::Clip,
                 "propscopy" => Action::PropsCopy,
+                "pagefield" => Action::PageField,
+                "sidebarbtn" => Action::SidebarButton,
                 "shot" => Action::Shot(parts.get(1).unwrap_or(&"capture").to_string()),
                 "wait" => Action::Wait(num(1)? as u64),
                 "quit" => Action::Quit,
@@ -220,6 +225,9 @@ pub struct App {
     thumb_y: Vec<f32>,
     status: bool,
     goto: Option<String>,
+    /// Champ de page tout juste ouvert : le contenu est sélectionné, le
+    /// premier chiffre tapé le remplace.
+    goto_fresh: bool,
     modifiers: ModifiersState,
     cursor: (f32, f32),
     press: Option<((f32, f32), (f32, f32))>,
@@ -247,7 +255,6 @@ pub struct App {
     thumbs: HashMap<usize, Tex>,
     labels: HashMap<usize, Tex>,
     status_tex: Option<(String, Tex)>,
-    goto_tex: Option<(String, Tex)>,
     last_status: Instant,
 
     nav: Option<Nav>,
@@ -278,6 +285,7 @@ impl App {
             thumb_y: Vec::new(),
             status: true,
             goto: None,
+            goto_fresh: false,
             modifiers: ModifiersState::empty(),
             cursor: (0.0, 0.0),
             press: None,
@@ -300,7 +308,6 @@ impl App {
             thumbs: HashMap::new(),
             labels: HashMap::new(),
             status_tex: None,
-            goto_tex: None,
             last_status: Instant::now(),
             nav: None,
             script,
@@ -325,11 +332,42 @@ impl App {
         if self.sidebar { self.opts.config.thumb_width as f32 + 2.0 * SIDEBAR_PAD } else { 0.0 }
     }
 
-    /// Zone d'affichage des pages (à droite du volet).
+    /// Hauteur de la barre d'outils (en haut de la fenêtre).
+    fn bar_h(&self) -> f32 {
+        (self.text_px() * 2.3).round()
+    }
+
+    /// Zone d'affichage des pages (sous la barre, à droite du volet).
     fn area(&self) -> Rect {
         let (w, h) = self.gpu.as_ref().map_or((1, 1), |g| g.size());
         let x = self.sidebar_width();
-        Rect::new(x, 0.0, (w as f32 - x).max(1.0), h as f32)
+        let y = self.bar_h();
+        Rect::new(x, y, (w as f32 - x).max(1.0), (h as f32 - y).max(1.0))
+    }
+
+    /// Hauteur des boutons et du champ de la barre.
+    fn bar_item_h(&self) -> f32 {
+        (self.text_px() * 1.7).round()
+    }
+
+    /// Bouton du volet des miniatures (à gauche de la barre).
+    fn sidebar_button(&self) -> Rect {
+        let h = self.bar_item_h();
+        Rect::new(8.0, ((self.bar_h() - h) / 2.0).round(), (h * 1.3).round(), h)
+    }
+
+    /// Champ « page » de la barre.
+    fn page_field(&self) -> Rect {
+        let px = self.text_px();
+        let b = self.sidebar_button();
+        let digits = self.engine.as_ref().map_or(3, |e| e.page_count.to_string().len()).max(3);
+        let w = self.text_width(&"0".repeat(digits + 1), px) + px;
+        Rect::new((b.x + b.w + px).round(), b.y, w.round(), b.h)
+    }
+
+    /// Texte « / N » affiché après le champ de page.
+    fn page_total_label(&self) -> String {
+        format!("/ {}", self.engine.as_ref().map_or(0, |e| e.page_count))
     }
 
     fn viewport(&self) -> (u32, u32) {
@@ -734,12 +772,13 @@ impl App {
         self.text.as_ref().map_or(s.len() as f32 * px * 0.55, |t| t.width(s, px))
     }
 
-    /// Bouton « Options », en haut à droite de la zone des pages.
+    /// Bouton « Options », à droite de la barre d'outils.
     fn options_button(&self) -> Rect {
         let px = self.text_px();
-        let a = self.area();
-        let (w, h) = (self.text_width("Options", px) + px * 1.6, px * 1.9);
-        Rect::new((a.x + a.w - w - 12.0).round(), 12.0, w.round(), h.round())
+        let ww = self.gpu.as_ref().map_or(1, |g| g.size().0) as f32;
+        let h = self.bar_item_h();
+        let w = self.text_width("Options", px) + px * 1.6;
+        Rect::new((ww - w - 8.0).round(), ((self.bar_h() - h) / 2.0).round(), w.round(), h)
     }
 
     fn open_context_menu(&mut self, x: f32, y: f32) {
@@ -830,7 +869,7 @@ impl App {
     }
 
     fn thumb_at(&self, y: f32) -> Option<usize> {
-        let y = y + self.sidebar_scroll;
+        let y = y - self.bar_h() + self.sidebar_scroll;
         let i = self.thumb_y.partition_point(|&t| t <= y).checked_sub(1)?;
         (i < self.engine().page_count).then_some(i)
     }
@@ -870,8 +909,18 @@ impl App {
         // Saisie d'un numéro de page.
         if let Some(input) = self.goto.as_mut() {
             match logical {
-                Key::Character(c) if c.chars().all(|c| c.is_ascii_digit()) => input.push_str(c),
+                Key::Character(c) if c.chars().all(|c| c.is_ascii_digit()) => {
+                    if self.goto_fresh {
+                        input.clear();
+                    }
+                    self.goto_fresh = false;
+                    input.push_str(c);
+                }
                 Key::Named(NamedKey::Backspace) => {
+                    if self.goto_fresh {
+                        input.clear();
+                    }
+                    self.goto_fresh = false;
                     input.pop();
                 }
                 Key::Named(NamedKey::Enter) => {
@@ -946,8 +995,11 @@ impl App {
         }
     }
 
+    /// Ouvre le champ de page : avec `initial` (chiffre tapé), ou vide
+    /// (`g`, Ctrl+G) ; sans contenu, il montre la page courante sélectionnée.
     fn open_goto(&mut self, initial: String) {
-        self.goto = Some(initial);
+        self.goto_fresh = initial.is_empty();
+        self.goto = Some(if initial.is_empty() { (self.current + 1).to_string() } else { initial });
         self.request_redraw();
     }
 
@@ -972,6 +1024,9 @@ impl App {
             MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32, false),
         };
         let (cx, cy) = self.cursor;
+        if cy < self.bar_h() {
+            return;
+        }
         if cx < self.sidebar_width() {
             let step = if lines { dy * 120.0 * self.scale_factor } else { dy };
             self.sidebar_scroll -= step;
@@ -1067,7 +1122,9 @@ impl App {
         if self.engine.is_none() || self.props.is_some() {
             return;
         }
-        let icon = if self.options_button().contains(x, y) || x < self.sidebar_width() {
+        let icon = if self.page_field().contains(x, y) {
+            CursorIcon::Text
+        } else if y < self.bar_h() || x < self.sidebar_width() {
             CursorIcon::Default
         } else if self.link_at(x, y).is_some() {
             CursorIcon::Pointer
@@ -1126,8 +1183,24 @@ impl App {
                     return;
                 }
                 if self.options_button().contains(x, y) {
+                    self.goto = None;
                     self.open_options_menu();
                     return;
+                }
+                if self.page_field().contains(x, y) {
+                    self.open_goto(String::new());
+                    return;
+                }
+                // Un clic ailleurs annule la saisie de page.
+                if self.goto.take().is_some() {
+                    self.request_redraw();
+                }
+                if self.sidebar_button().contains(x, y) {
+                    self.toggle_sidebar();
+                    return;
+                }
+                if y < self.bar_h() {
+                    return; // reste de la barre
                 }
                 if x >= self.sidebar_width() {
                     let anchor = self.page_text().and_then(|t| {
@@ -1162,7 +1235,7 @@ impl App {
                 self.press = None;
                 self.dragging = false;
                 self.set_cursor(CursorIcon::Default);
-                if !was_drag && x >= self.sidebar_width() && self.props.is_none() {
+                if !was_drag && x >= self.sidebar_width() && y >= self.bar_h() && self.props.is_none() {
                     self.open_context_menu(x, y);
                 }
             }
@@ -1309,7 +1382,8 @@ impl App {
     /// Textes de l'interface affichés cette frame (bouton, menu, propriétés, message).
     fn ui_strings(&self) -> Vec<(String, f32)> {
         let px = self.text_px();
-        let mut v = vec![("Options".to_string(), px)];
+        let mut v = vec![("Options".to_string(), px), (self.page_total_label(), px)];
+        v.push((self.goto.clone().unwrap_or_else(|| (self.current + 1).to_string()), px));
         if let Some(m) = &self.menu {
             v.extend(m.items.iter().map(|(l, _)| (l.clone(), px)));
         }
@@ -1356,6 +1430,38 @@ impl App {
                 items.push(plain(t, Rect::new(x.round(), y.round(), t.w as f32, t.h as f32), tint));
             }
         };
+        // Barre d'outils.
+        let (ww, _) = g.size();
+        items.push(plain(g.white(), Rect::new(0.0, 0.0, ww as f32, self.bar_h()), [0.07, 0.07, 0.08, 1.0]));
+        items.push(plain(g.white(), Rect::new(0.0, self.bar_h() - 1.0, ww as f32, 1.0), [0.2, 0.2, 0.22, 1.0]));
+        // Bouton du volet : trois traits, dessinés (indépendants de la police).
+        let sb = self.sidebar_button();
+        let hv = sb.contains(self.cursor.0, self.cursor.1);
+        let bg = if self.sidebar { [0.16, 0.36, 0.7, 1.0] } else if hv { [0.2, 0.2, 0.23, 1.0] } else { [0.13, 0.13, 0.15, 1.0] };
+        items.push(plain(g.white(), sb, bg));
+        let (lw, lh) = ((sb.w * 0.5).round(), (sb.h * 0.09).round().max(2.0));
+        for i in 0..3 {
+            let ly = (sb.y + sb.h * (0.3 + 0.2 * i as f32) - lh / 2.0).round();
+            items.push(plain(g.white(), Rect::new((sb.x + (sb.w - lw) / 2.0).round(), ly, lw, lh), [0.9, 0.9, 0.9, 1.0]));
+        }
+        // Champ de page.
+        let f = self.page_field();
+        let editing = self.goto.is_some();
+        items.push(plain(g.white(), f, if editing { [0.95, 0.95, 0.95, 1.0] } else { [0.16, 0.16, 0.18, 1.0] }));
+        let shown = self.goto.clone().unwrap_or_else(|| (self.current + 1).to_string());
+        let tw = self.text_width(&shown, px);
+        let tx = (f.x + f.w - tw - px * 0.5).round(); // aligné à droite
+        let ty = f.y + (f.h - px * 1.3) / 2.0;
+        if editing && self.goto_fresh {
+            items.push(plain(g.white(), Rect::new(tx - 2.0, f.y + 4.0, tw + 4.0, f.h - 8.0), [0.16, 0.36, 0.7, 1.0]));
+        }
+        let ink = if editing && !self.goto_fresh { [0.0, 0.0, 0.0, 1.0] } else { [0.95, 0.95, 0.95, 0.95] };
+        label(items, &shown, px, tx, ty, ink);
+        if editing && !self.goto_fresh {
+            items.push(plain(g.white(), Rect::new(tx + tw + 1.0, f.y + 5.0, 2.0, f.h - 10.0), [0.0, 0.0, 0.0, 1.0]));
+        }
+        let total = self.page_total_label();
+        label(items, &total, px, f.x + f.w + px * 0.5, ty, [0.8, 0.8, 0.8, 0.8]);
         // Bouton « Options ».
         let b = self.options_button();
         let hover = b.contains(self.cursor.0, self.cursor.1) || self.menu.as_ref().is_some_and(|m| m.items.len() == 6);
@@ -1397,7 +1503,7 @@ impl App {
                 let a = self.area();
                 let (w, h) = (tex.w as f32 + 2.0 * px, tex.h as f32 + px);
                 let x = (a.x + (a.w - w) / 2.0).round();
-                let y = (a.h - h - px * 3.0).round();
+                let y = (a.y + a.h - h - px * 3.0).round();
                 items.push(plain(g.white(), Rect::new(x, y, w, h), [0.1, 0.1, 0.12, 0.92]));
                 items.push(plain(tex, Rect::new(x + px, y + px / 2.0, tex.w as f32, tex.h as f32), WHITE));
             }
@@ -1430,8 +1536,9 @@ impl App {
 
     fn visible_thumbs(&self, h: f32) -> (usize, usize) {
         let n = self.engine().page_count;
-        let first = self.thumb_at(0.0).unwrap_or(0);
-        let last = self.thumb_at(h - 1.0).unwrap_or(n - 1);
+        let top = self.bar_h();
+        let first = self.thumb_at(top).unwrap_or(0);
+        let last = self.thumb_at(top + h - 1.0).unwrap_or(n - 1);
         (first, last.min(n - 1))
     }
 
@@ -1442,11 +1549,12 @@ impl App {
         let g = self.gpu.as_ref().unwrap();
         let w = self.sidebar_width();
         let h = self.area().h;
-        items.push(Draw { tex: g.white(), dest: Rect::new(0.0, 0.0, w, h), tint: [0.09, 0.09, 0.1, 1.0], rot: 0 });
+        let top = self.bar_h();
+        items.push(Draw { tex: g.white(), dest: Rect::new(0.0, top, w, h), tint: [0.09, 0.09, 0.1, 1.0], rot: 0 });
         let tw = self.opts.config.thumb_width as f32;
         let (first, last) = self.visible_thumbs(h);
         for p in first..=last {
-            let y = self.thumb_y[p] - self.sidebar_scroll;
+            let y = self.thumb_y[p] - self.sidebar_scroll + top;
             let th = self.thumb_height(p);
             let dest = Rect::new(SIDEBAR_PAD, y, tw, th);
             if p == self.current {
@@ -1506,14 +1614,6 @@ impl App {
                 self.status_tex = Some((line, tex));
             }
         }
-        if let Some(input) = &self.goto {
-            let line = format!("Aller à la page : {input}_   (Entrée : valider, Échap : annuler)");
-            if self.goto_tex.as_ref().is_none_or(|(s, _)| *s != line) {
-                let img = text.render(&line, px * 1.3);
-                let tex = self.gpu.as_ref().unwrap().upload(img.w, img.h, &img.data, false);
-                self.goto_tex = Some((line, tex));
-            }
-        }
     }
 
     fn push_overlay<'a>(&'a self, items: &mut Vec<Draw<'a>>) {
@@ -1522,21 +1622,14 @@ impl App {
         if self.status
             && let Some((_, t)) = &self.status_tex {
                 let bh = t.h as f32 + 10.0;
-                items.push(Draw { tex: g.white(), dest: Rect::new(a.x, a.h - bh, a.w, bh), tint: [0.0, 0.0, 0.0, 0.72], rot: 0 });
+                let bottom = a.y + a.h;
+                items.push(Draw { tex: g.white(), dest: Rect::new(a.x, bottom - bh, a.w, bh), tint: [0.0, 0.0, 0.0, 0.72], rot: 0 });
                 items.push(Draw {
                     tex: t,
-                    dest: Rect::new(a.x + 12.0, (a.h - bh + 5.0).round(), t.w as f32, t.h as f32),
+                    dest: Rect::new(a.x + 12.0, (bottom - bh + 5.0).round(), t.w as f32, t.h as f32),
                     tint: [0.92, 0.92, 0.92, 0.92],
                     rot: 0,
                 });
-            }
-        if self.goto.is_some()
-            && let Some((_, t)) = &self.goto_tex {
-                let (bw, bh) = (t.w as f32 + 48.0, t.h as f32 + 28.0);
-                let bx = (a.x + (a.w - bw) / 2.0).round();
-                let by = (a.h * 0.75 - bh / 2.0).round();
-                items.push(Draw { tex: g.white(), dest: Rect::new(bx, by, bw, bh), tint: [0.12, 0.12, 0.14, 0.95], rot: 0 });
-                items.push(Draw { tex: t, dest: Rect::new(bx + 24.0, by + 14.0, t.w as f32, t.h as f32), tint: WHITE, rot: 0 });
             }
     }
 
@@ -1586,7 +1679,7 @@ impl App {
                 if self.thumb_y.len() > p {
                     self.sidebar_scroll = (self.thumb_y[p] - 50.0).max(0.0);
                     self.clamp_sidebar();
-                    let y = self.thumb_y[p] - self.sidebar_scroll + 10.0;
+                    let y = self.thumb_y[p] - self.sidebar_scroll + self.bar_h() + 10.0;
                     self.click(SIDEBAR_PAD + 10.0, y);
                 }
             }
@@ -1688,6 +1781,13 @@ impl App {
                     text.map(|t| t.chars().take(120).collect::<String>()),
                     image
                 );
+            }
+            Action::PageField | Action::SidebarButton => {
+                let r = if matches!(a_ref, Action::PageField) { self.page_field() } else { self.sidebar_button() };
+                self.on_cursor(r.x + r.w / 2.0, r.y + r.h / 2.0);
+                self.mouse_button(MouseButton::Left, ElementState::Pressed);
+                self.mouse_button(MouseButton::Left, ElementState::Released);
+                eprintln!("[script] clic {a_ref:?} : saisie {:?}, volet {}", self.goto, self.sidebar);
             }
             Action::PropsCopy => {
                 if let Some(lines) = self.props.clone() {

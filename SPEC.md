@@ -104,6 +104,7 @@ Tous les raccourcis sont centralisés dans une table (reconfigurable en v2).
 | Glisser au clic droit : déplacer la vue | Oui (auparavant au clic gauche). |
 | Clic gauche : sélection du texte | Glisser au clic gauche ; texte de toutes les pages extrait en arrière-plan par MuPDF (WFRP5 : 1,2 million de caractères en 1,5 s) ; sélection dans l'ordre de lecture, surlignée en bleu ; `Ctrl+C`, `Ctrl+A`, `Échap`. Un simple clic suit toujours les liens. |
 | Volet masqué par défaut | Oui (`F9`). |
+| Barre en haut : champ de page (page courante par défaut), bouton du volet à gauche | Barre d'outils au-dessus des pages : bouton du volet (trois traits, bleu quand ouvert) ; champ de page qui affiche la page courante — un clic la sélectionne, les chiffres tapés la remplacent, `Entrée` y va, `Échap` annule ; « / N » ; bouton « Options » à droite. Taper des chiffres n'importe où remplit ce champ (remplace l'ancienne fenêtre « Aller à la page »). |
 
 ## 3. Choix du moteur PDF
 

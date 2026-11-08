@@ -22,7 +22,7 @@ cargo build --release
 | Action | Touches / souris |
 |---|---|
 | Page suivante / précédente | `→` `←`, `PgDown` `PgUp`, `Espace` / `Maj+Espace`, `j` `k`, `l` `h`, molette (page entière visible ; page zoomée : un cran de plus une fois le bas ou le haut atteint) |
-| Aller à la page *n* | taper le numéro puis `Entrée` (ou `g`, `Ctrl+G`) ; `Échap` annule. **AZERTY** : chiffres avec `Maj` ou pavé numérique (sans `Maj`, la rangée du haut donne `& é " ' ( - …`, et `-` reste le zoom arrière) |
+| Aller à la page *n* | champ de page de la barre d'outils (clic, numéro, `Entrée`), ou taper le numéro n'importe où (ou `g`, `Ctrl+G`) ; `Échap` annule. **AZERTY** : chiffres avec `Maj` ou pavé numérique (sans `Maj`, la rangée du haut donne `& é " ' ( - …`, et `-` reste le zoom arrière) |
 | Début / fin | `Début` / `Fin` |
 | Précédent / suivant (historique) | `Alt+←` / `Alt+→`, `Retour arrière` / `Maj+Retour arrière`, boutons latéraux de la souris |
 | Lien interne | clic (le curseur devient une main) |
@@ -30,9 +30,9 @@ cargo build --release
 | Défilement (page zoomée) | molette, `↑` `↓`, **glisser au clic droit** |
 | Sélection de texte | **glisser au clic gauche** (curseur texte au survol) ; `Ctrl+A` tout sélectionner, `Ctrl+C` copier, `Échap` désélectionner |
 | Menu contextuel | **clic droit** (sans bouger) : copier le texte, copier l'image de la page, tout sélectionner |
-| Menu Options | bouton en haut à droite : imprimer, plein écran, pivoter, volet des miniatures, propriétés |
+| Barre d'outils | à gauche : bouton du volet des miniatures ; champ de page (page courante) ; à droite : bouton « Options » (imprimer, plein écran, pivoter, volet des miniatures, propriétés) |
 | Pivoter | `R` (sens horaire), `E` (sens anti-horaire) |
-| Volet des miniatures | `F9` (masqué au démarrage ; clic sur une miniature pour y aller) |
+| Volet des miniatures | bouton à gauche de la barre ou `F9` (masqué au démarrage ; clic sur une miniature pour y aller) |
 | Barre d'état / plein écran | `F1` / `F11` |
 | Quitter | `q`, `Ctrl+W` |
 
