@@ -853,6 +853,7 @@ dependencies = [
 name = "greedpdf"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "anyhow",
  "backend-hayro",
  "backend-mupdf",

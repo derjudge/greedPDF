@@ -138,7 +138,7 @@ pub fn downscale(src: &PixelBuf, dw: u32, dh: u32) -> PixelBuf {
             let row = &src.data[sy * stride..(sy + 1) * stride];
             for (x, &(x0, x1)) in cols.iter().enumerate() {
                 let a = &mut acc[x * 4..x * 4 + 4];
-                for px in row[x0 * 4..x1 * 4].chunks_exact(4) {
+                for px in row[x0 * 4..x1 * 4].as_chunks::<4>().0 {
                     a[0] += px[0] as u32;
                     a[1] += px[1] as u32;
                     a[2] += px[2] as u32;

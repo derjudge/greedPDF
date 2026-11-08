@@ -145,7 +145,7 @@ fn diff(a: &PixelBuf, b: &PixelBuf) -> (f64, f64) {
         return (255.0, 100.0);
     }
     let (mut sum, mut big) = (0u64, 0u64);
-    for (pa, pb) in a.data.chunks_exact(4).zip(b.data.chunks_exact(4)) {
+    for (pa, pb) in a.data.as_chunks::<4>().0.iter().zip(b.data.chunks_exact(4)) {
         let d = (0..3).map(|i| pa[i].abs_diff(pb[i]) as u64).max().unwrap();
         sum += d;
         big += (d > 64) as u64;
@@ -313,11 +313,10 @@ fn bench<B: Backend>(src: &DocSource, args: &Args, threads: &[usize]) {
             );
         }
     }
-    if let Some(dir) = &args.png {
-        if let Err(e) = dump_png::<B>(src, dir, args.height) {
+    if let Some(dir) = &args.png
+        && let Err(e) = dump_png::<B>(src, dir, args.height) {
             println!("  PNG : échec : {e:#}");
         }
-    }
 }
 
 fn main() -> Result<()> {

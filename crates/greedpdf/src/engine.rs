@@ -35,6 +35,11 @@ const L0_SHARE: f64 = 0.80;
 /// seuil d'éviction (100 %) : pas d'oscillation rendu / éviction.
 const BACKGROUND_FILL: f64 = 0.90;
 const GOVERNOR_TICK: Duration = Duration::from_millis(250);
+/// Workers toujours disponibles pour les tâches interactives (page visible,
+/// tuiles, voisines) : un rendu en cours ne peut pas être interrompu, donc
+/// sans réserve une action de l'utilisateur attendrait la fin d'un rendu
+/// d'arrière-plan (~0,5 s).
+const INTERACTIVE_RESERVE: usize = 2;
 
 /// Identifiant d'une image en cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -104,6 +109,8 @@ pub struct Stats {
 struct Sched {
     view: View,
     in_flight: HashSet<ImgKey>,
+    /// Tâches d'arrière-plan (étapes 6 et 7) en cours.
+    background_running: usize,
     shutdown: bool,
     s_target: f32,
     budget: usize,
@@ -250,7 +257,10 @@ impl Shared {
                         if c.bytes + job.bytes > budget && job.stage != 1 {
                             return None;
                         }
-                    } else if (c.bytes + job.bytes) as f64 > budget as f64 * BACKGROUND_FILL {
+                    } else if (c.bytes + job.bytes) as f64 > budget as f64 * BACKGROUND_FILL
+                        || s.background_running + INTERACTIVE_RESERVE.min(self.cfg.threads - 1)
+                            >= self.cfg.threads
+                    {
                         return None;
                     }
                     return Some(job);
@@ -394,6 +404,12 @@ impl WorkerBackends {
                 return Ok(());
             }
             self.try_mupdf(req, out)
+        } else if std::env::var_os("GREEDPDF_TILES_HAYRO").is_some() {
+            // Expérimental (comparaisons) : tuiles rendues par hayro.
+            if self.try_hayro(req, out) {
+                return Ok(());
+            }
+            self.try_mupdf(req, out)
         } else {
             match self.try_mupdf(req, out) {
                 Ok(()) => Ok(()),
@@ -411,7 +427,6 @@ pub struct Engine {
     shared: Arc<Shared>,
     workers: Vec<JoinHandle<()>>,
     pub page_count: usize,
-    pub started: Instant,
 }
 
 impl Engine {
@@ -437,6 +452,7 @@ impl Engine {
             sched: Mutex::new(Sched {
                 view,
                 in_flight: HashSet::new(),
+                background_running: 0,
                 shutdown: false,
                 s_target: 1.0,
                 budget: 512 << 20,
@@ -477,7 +493,7 @@ impl Engine {
                 }
             })?;
         }
-        Ok(Self { shared, workers, page_count: n, started: Instant::now() })
+        Ok(Self { shared, workers, page_count: n })
     }
 
     pub fn page_size(&self, page: usize) -> SizePt {
@@ -574,6 +590,9 @@ fn worker(shared: Arc<Shared>, src: DocSource, hayro_ok: bool, notify: Arc<dyn N
                 };
                 if let Some(job) = job {
                     s.in_flight.insert(job.key);
+                    if job.stage >= 6 {
+                        s.background_running += 1;
+                    }
                     break job;
                 }
                 s = shared.wake.wait_timeout(s, Duration::from_millis(500)).unwrap().0;
@@ -613,6 +632,9 @@ fn worker(shared: Arc<Shared>, src: DocSource, hayro_ok: bool, notify: Arc<dyn N
             // voir la tâche ni « en cours » ni « en cache » et la refaire.
             let mut s = shared.sched.lock().unwrap();
             s.in_flight.remove(&job.key);
+            if job.stage >= 6 {
+                s.background_running -= 1;
+            }
             s.rendered += 1;
             let mut c = shared.cache.lock().unwrap();
             let keep = match job.key {
@@ -631,6 +653,7 @@ fn worker(shared: Arc<Shared>, src: DocSource, hayro_ok: bool, notify: Arc<dyn N
             }
             keep
         };
+        shared.wake.notify_all();
         if keep {
             notify.ready(job.key);
         }

@@ -1,5 +1,8 @@
-//! Affichage wgpu : une texture par page affichée, dessinée sur un quad.
+//! Affichage wgpu : textures (pages, tuiles, miniatures, texte) dessinées sur
+//! des quads. Les pages ont des mipmaps : réduites par le GPU (zoom ≤ S),
+//! elles restent nettes, sans scintillement (SPEC.md §6).
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -7,8 +10,9 @@ use winit::window::Window;
 
 const SHADER: &str = r#"
 struct Quad {
-    // Rectangle de destination en coordonnées normalisées (-1..1) : x0, y0, x1, y1.
-    rect: vec4<f32>,
+    rect: vec4<f32>,   // destination, coordonnées normalisées : x0, y0, x1, y1
+    uv: vec4<f32>,     // zone de la texture : u0, v0, u1, v1
+    tint: vec4<f32>,   // multiplicateur de couleur (prémultiplié)
 };
 @group(0) @binding(0) var<uniform> quad: Quad;
 @group(0) @binding(1) var tex: texture_2d<f32>;
@@ -21,30 +25,80 @@ struct VsOut {
 
 @vertex
 fn vs(@builtin(vertex_index) i: u32) -> VsOut {
-    // Deux triangles en bande : (0,0) (1,0) (0,1) (1,1).
     let u = f32(i & 1u);
     let v = f32(i >> 1u);
     var out: VsOut;
     out.pos = vec4<f32>(mix(quad.rect.x, quad.rect.z, u), mix(quad.rect.y, quad.rect.w, v), 0.0, 1.0);
-    out.uv = vec2<f32>(u, v);
+    out.uv = vec2<f32>(mix(quad.uv.x, quad.uv.z, u), mix(quad.uv.y, quad.uv.w, v));
     return out;
 }
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    return textureSample(tex, samp, in.uv);
+    return textureSample(tex, samp, in.uv) * quad.tint;
 }
 "#;
 
-/// Couleur de fond autour de la page (sRGB linéarisé).
-const BACKGROUND: wgpu::Color = wgpu::Color { r: 0.02, g: 0.02, b: 0.025, a: 1.0 };
+/// Génération des mipmaps : chaque niveau est la moyenne 2×2 du précédent.
+const MIP_SHADER: &str = r#"
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
 
-/// Texture d'une page sur le GPU.
-pub struct PageTexture {
-    pub page: usize,
-    pub scale: f32,
-    pub size: (u32, u32),
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> VsOut {
+    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    var out: VsOut;
+    out.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+    out.uv = vec2<f32>(p.x, 1.0 - p.y);
+    return out;
+}
+
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    return textureSampleLevel(src, samp, in.uv, 0.0);
+}
+"#;
+
+const QUAD_UNIFORM: u64 = 48;
+const MAX_QUADS: u64 = 4096;
+const TEX_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+/// Une texture sur le GPU, prête à dessiner.
+pub struct Tex {
+    pub w: u32,
+    pub h: u32,
     bind_group: wgpu::BindGroup,
+}
+
+/// Rectangle en pixels de la fenêtre.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl Rect {
+    pub fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
+        Self { x, y, w, h }
+    }
+    pub fn contains(&self, px: f32, py: f32) -> bool {
+        px >= self.x && py >= self.y && px < self.x + self.w && py < self.y + self.h
+    }
+}
+
+/// Un élément à dessiner.
+pub struct Draw<'a> {
+    pub tex: &'a Tex,
+    pub dest: Rect,
+    /// Couleur multipliée (RGBA prémultiplié, 0..1). Blanc = texture telle quelle.
+    pub tint: [f32; 4],
 }
 
 pub struct Gpu {
@@ -55,8 +109,15 @@ pub struct Gpu {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
-    uniform: wgpu::Buffer,
+    sampler_mip: wgpu::Sampler,
+    sampler_plain: wgpu::Sampler,
+    uniforms: wgpu::Buffer,
+    uniform_stride: u64,
+    mip_pipeline: wgpu::RenderPipeline,
+    mip_layout: wgpu::BindGroupLayout,
+    /// Texture blanche 1×1 : rectangles de couleur unie.
+    white: Option<Tex>,
+    pub background: [f32; 3],
 }
 
 impl Gpu {
@@ -70,12 +131,11 @@ impl Gpu {
             ..Default::default()
         }))
         .context("aucun adaptateur GPU compatible")?;
-        let adapter_limits = adapter.limits();
+        let al = adapter.limits();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("greedpdf"),
-            // Les pages rendues peuvent dépasser 8192 px (zoom, écran 4K).
             required_limits: wgpu::Limits {
-                max_texture_dimension_2d: adapter_limits.max_texture_dimension_2d,
+                max_texture_dimension_2d: al.max_texture_dimension_2d,
                 ..wgpu::Limits::default()
             },
             ..Default::default()
@@ -85,7 +145,6 @@ impl Gpu {
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .context("surface non supportée")?;
-        // Format sRGB : les pixels des pages (sRGB) sont restitués tels quels.
         let caps = surface.get_capabilities(&adapter);
         if let Some(f) = caps.formats.iter().find(|f| f.is_srgb()) {
             config.format = *f;
@@ -94,49 +153,52 @@ impl Gpu {
         config.desired_maximum_frame_latency = 1;
         surface.configure(&device, &config);
 
+        // Pipeline principal.
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("page"),
+            label: Some("quad"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
         });
+        let tex_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let sampler_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("page"),
+            label: Some("quad"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                        has_dynamic_offset: true,
+                        min_binding_size: NonZeroU64::new(QUAD_UNIFORM),
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
+                tex_entry(1),
+                sampler_entry(2),
             ],
         });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("page"),
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("quad"),
             bind_group_layouts: &[Some(&layout)],
             ..Default::default()
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("page"),
-            layout: Some(&pipeline_layout),
+            label: Some("quad"),
+            layout: Some(&pl),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs"),
@@ -146,7 +208,11 @@ impl Gpu {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs"),
-                targets: &[Some(config.format.into())],
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState {
@@ -158,19 +224,86 @@ impl Gpu {
             multiview_mask: None,
             cache: None,
         });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("page"),
+
+        // Pipeline des mipmaps.
+        let mip_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("mip"),
+            source: wgpu::ShaderSource::Wgsl(MIP_SHADER.into()),
+        });
+        let mip_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mip"),
+            entries: &[tex_entry(0), sampler_entry(1)],
+        });
+        let mpl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mip"),
+            bind_group_layouts: &[Some(&mip_layout)],
+            ..Default::default()
+        });
+        let mip_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("mip"),
+            layout: Some(&mpl),
+            vertex: wgpu::VertexState {
+                module: &mip_shader,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &mip_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(TEX_FORMAT.into())],
+                compilation_options: Default::default(),
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let sampler_mip = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("trilinéaire"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+        let sampler_plain = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("linéaire"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("quad"),
-            size: 16,
+        let align = device.limits().min_uniform_buffer_offset_alignment as u64;
+        let uniform_stride = QUAD_UNIFORM.div_ceil(align) * align;
+        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("quads"),
+            size: uniform_stride * MAX_QUADS,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Ok(Self { window, surface, device, queue, config, pipeline, layout, sampler, uniform })
+
+        let mut me = Self {
+            window,
+            surface,
+            device,
+            queue,
+            config,
+            pipeline,
+            layout,
+            sampler_mip,
+            sampler_plain,
+            uniforms,
+            uniform_stride,
+            mip_pipeline,
+            mip_layout,
+            white: None,
+            background: [0.02, 0.02, 0.025],
+        };
+        me.white = Some(me.upload(1, 1, &[255, 255, 255, 255], false));
+        Ok(me)
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -185,17 +318,26 @@ impl Gpu {
         }
     }
 
-    /// Envoie une page rendue (RGBA8 sRGB) au GPU.
-    pub fn upload(&self, page: usize, scale: f32, w: u32, h: u32, rgba: &[u8]) -> PageTexture {
+    pub fn white(&self) -> &Tex {
+        self.white.as_ref().expect("créée dans Gpu::new")
+    }
+
+    /// Envoie une image RGBA8 (sRGB, alpha prémultiplié) au GPU, avec ou sans mipmaps.
+    pub fn upload(&self, w: u32, h: u32, rgba: &[u8], mipmaps: bool) -> Tex {
+        let levels = if mipmaps { 32 - w.max(h).max(1).leading_zeros() } else { 1 };
         let extent = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+        let mut usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
+        if levels > 1 {
+            usage |= wgpu::TextureUsages::RENDER_ATTACHMENT;
+        }
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("page"),
+            label: Some("image"),
             size: extent,
-            mip_level_count: 1,
+            mip_level_count: levels,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            format: TEX_FORMAT,
+            usage,
             view_formats: &[],
         });
         self.queue.write_texture(
@@ -209,56 +351,123 @@ impl Gpu {
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
             extent,
         );
+        if levels > 1 {
+            self.generate_mips(&texture, levels);
+        }
         let view = texture.create_view(&Default::default());
+        let sampler = if levels > 1 { &self.sampler_mip } else { &self.sampler_plain };
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("page"),
+            label: Some("image"),
             layout: &self.layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.uniforms,
+                        offset: 0,
+                        size: NonZeroU64::new(QUAD_UNIFORM),
+                    }),
+                },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
             ],
         });
-        PageTexture { page, scale, size: (w, h), bind_group }
+        Tex { w, h, bind_group }
     }
 
-    /// Dessine la page dans le rectangle `dest` (pixels de la fenêtre : x, y, w, h).
-    pub fn draw(&mut self, page: Option<(&PageTexture, [f32; 4])>) {
+    fn generate_mips(&self, texture: &wgpu::Texture, levels: u32) {
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        let view = |level| {
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                base_mip_level: level,
+                mip_level_count: Some(1),
+                ..Default::default()
+            })
+        };
+        for level in 1..levels {
+            let src = view(level - 1);
+            let dst = view(level);
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("mip"),
+                layout: &self.mip_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler_plain) },
+                ],
+            });
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("mip"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &dst,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.mip_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit([enc.finish()]);
+    }
+
+    /// Dessine une frame : fond, puis les éléments dans l'ordre.
+    pub fn draw(&self, items: &[Draw]) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
+                self.window.request_redraw();
                 return;
             }
             _ => return,
         };
-        let view = frame.texture.create_view(&Default::default());
-        if let Some((_, dest)) = page {
-            let (ww, wh) = (self.config.width as f32, self.config.height as f32);
-            let ndc = [
-                dest[0] / ww * 2.0 - 1.0,
-                1.0 - dest[1] / wh * 2.0,
-                (dest[0] + dest[2]) / ww * 2.0 - 1.0,
-                1.0 - (dest[1] + dest[3]) / wh * 2.0,
+        let (ww, wh) = (self.config.width as f32, self.config.height as f32);
+        let items = &items[..items.len().min(MAX_QUADS as usize)];
+        let mut data = vec![0u8; (self.uniform_stride * items.len().max(1) as u64) as usize];
+        for (i, it) in items.iter().enumerate() {
+            let d = it.dest;
+            let v: [f32; 12] = [
+                d.x / ww * 2.0 - 1.0,
+                1.0 - d.y / wh * 2.0,
+                (d.x + d.w) / ww * 2.0 - 1.0,
+                1.0 - (d.y + d.h) / wh * 2.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
+                it.tint[0],
+                it.tint[1],
+                it.tint[2],
+                it.tint[3],
             ];
-            let bytes: Vec<u8> = ndc.iter().flat_map(|f| f.to_le_bytes()).collect();
-            self.queue.write_buffer(&self.uniform, 0, &bytes);
+            let off = i * self.uniform_stride as usize;
+            for (j, f) in v.iter().enumerate() {
+                data[off + j * 4..off + j * 4 + 4].copy_from_slice(&f.to_le_bytes());
+            }
         }
+        self.queue.write_buffer(&self.uniforms, 0, &data);
+        let view = frame.texture.create_view(&Default::default());
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
+            let [r, g, b] = self.background;
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("page"),
+                label: Some("frame"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(BACKGROUND), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 ..Default::default()
             });
-            if let Some((tex, _)) = page {
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &tex.bind_group, &[]);
+            pass.set_pipeline(&self.pipeline);
+            for (i, it) in items.iter().enumerate() {
+                pass.set_bind_group(0, &it.tex.bind_group, &[(i as u64 * self.uniform_stride) as u32]);
                 pass.draw(0..4, 0..1);
             }
         }
