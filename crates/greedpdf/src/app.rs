@@ -259,6 +259,7 @@ pub struct App {
     /// Textures des résultats visibles : page, avant, occurrence, après.
     result_tex: HashMap<usize, [Tex; 4]>,
     chevrons: Option<(Tex, Tex)>,
+    cross: Option<Tex>,
     modifiers: ModifiersState,
     cursor: (f32, f32),
     press: Option<((f32, f32), (f32, f32))>,
@@ -332,6 +333,7 @@ impl App {
             results_scroll: 0.0,
             result_tex: HashMap::new(),
             chevrons: None,
+            cross: None,
             modifiers: ModifiersState::empty(),
             cursor: (0.0, 0.0),
             press: None,
@@ -454,6 +456,13 @@ impl App {
         let ww = (self.text_width("Mots entiers", px) + px * 1.2).round();
         let words = Rect::new(case.x + case.w + 4.0, f.y, ww, f.h);
         [prev, next, case, words]
+    }
+
+    /// Croix de fermeture, à droite de la barre de recherche.
+    fn search_close(&self) -> Rect {
+        let f = self.search_field();
+        let ww = self.gpu.as_ref().map_or(1, |g| g.size().0) as f32;
+        Rect::new(ww - f.h - 8.0, f.y, f.h, f.h)
     }
 
     /// Compteur de résultats (barre de recherche).
@@ -894,6 +903,14 @@ impl App {
         self.update_view();
     }
 
+    /// Croix de la barre de recherche : fin de la recherche, volet fermé,
+    /// surlignage effacé ; on reste sur la page affichée.
+    fn end_search(&mut self) {
+        self.close_search();
+        self.sidebar = false;
+        self.update_view();
+    }
+
     /// Ferme la recherche (Échap) : efface les résultats, rétablit le volet.
     fn close_search(&mut self) {
         if !self.search_open {
@@ -1063,6 +1080,26 @@ impl App {
                 items.push(plain(t, Rect::new(SIDEBAR_PAD, top + SIDEBAR_PAD, t.w as f32, t.h as f32), [0.7, 0.7, 0.7, 0.8]));
             }
         }
+    }
+
+    /// Croix (deux diagonales) pour fermer la barre de recherche.
+    fn make_cross(size: u32) -> greedpdf_core::PixelBuf {
+        let mut img = greedpdf_core::PixelBuf::default();
+        img.reset(size, size);
+        let s = size as f32;
+        let (m, th) = (0.18 * s, 0.1 * s);
+        for y in 0..size {
+            for x in 0..size {
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                let inside = px >= m - th && px <= s - m + th && py >= m - th && py <= s - m + th;
+                // Distance aux deux diagonales x = y et x = s − y.
+                let d = ((px - py).abs().min((px + py - s).abs())) / std::f32::consts::SQRT_2 - th / 2.0;
+                let v = if inside { ((0.5 - d).clamp(0.0, 1.0) * 255.0) as u8 } else { 0 };
+                let i = ((y * size + x) * 4) as usize;
+                img.data[i..i + 4].copy_from_slice(&[v, v, v, v]);
+            }
+        }
+        img
     }
 
     /// Chevron (haut ou bas) pour les boutons précédent / suivant.
@@ -1673,6 +1710,10 @@ impl App {
                         self.open_search();
                         return;
                     }
+                    if self.search_close().contains(x, y) {
+                        self.end_search();
+                        return;
+                    }
                     let [prev, next, case, words] = self.search_buttons();
                     if prev.contains(x, y) || next.contains(x, y) {
                         self.search_step(next.contains(x, y));
@@ -1807,6 +1848,8 @@ impl App {
             let sz = (self.bar_item_h() * 0.7).round() as u32;
             let (u, d) = (Self::make_chevron(sz, true), Self::make_chevron(sz, false));
             self.chevrons = Some((g.upload(u.w, u.h, &u.data, false), g.upload(d.w, d.h, &d.data, false)));
+            let c = Self::make_cross((self.bar_item_h() * 0.55).round() as u32);
+            self.cross = Some(g.upload(c.w, c.h, &c.data, false));
         }
         self.prepare_result_textures();
 
@@ -2054,6 +2097,12 @@ impl App {
             }
             if let Some(l) = self.search_label() {
                 label(items, &l, px, words.x + words.w + px, sty, [0.8, 0.8, 0.8, 0.8]);
+            }
+            let cb = self.search_close();
+            let hv = cb.contains(self.cursor.0, self.cursor.1);
+            items.push(plain(g.white(), cb, if hv { [0.55, 0.15, 0.15, 1.0] } else { [0.13, 0.13, 0.15, 1.0] }));
+            if let Some(t) = &self.cross {
+                icon(items, t, cb);
             }
         }
         // Bouton « Options ».
@@ -2403,7 +2452,13 @@ impl App {
             }
             Action::SearchButton(which) => {
                 let [prev, next, case, words] = self.search_buttons();
-                let r = match which.as_str() { "prev" => prev, "case" => case, "words" => words, _ => next };
+                let r = match which.as_str() {
+                    "prev" => prev,
+                    "case" => case,
+                    "words" => words,
+                    "close" => self.search_close(),
+                    _ => next,
+                };
                 self.on_cursor(r.x + r.w / 2.0, r.y + r.h / 2.0);
                 self.mouse_button(MouseButton::Left, ElementState::Pressed);
                 self.mouse_button(MouseButton::Left, ElementState::Released);
